@@ -1,19 +1,66 @@
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
+.superpowers/
+db/
+incremental_db/
+simulation/
+timing/
+output_files/
+greybox_tmp/
+qdb/
+cdb/
+.nvim/
 
-# CLion
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#cmake-build-*
+*.rpt
+*.summary
+*.qws
+
+*.map.*
+*.fit.*
+*.asm.*
+*.sta.*
+
+*.bak
+*.tmp
+*.swp
+*.swo
+*.log
+*.qarlog
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+work/
+transcript
+vsim.wlf
+
+ip/
+.ip/
+
+# Artefatos de simulacao
+*.vcd
+*.out
+tb*.out
+
+# Evidencias geradas por teste
+
+# Ambientes virtuais Python
+venv/
+env/
+.venv/
+ENV/
+.ENV/
+__pycache__/
+*.pyc
+.pytest_cache/
+.tox/
+*.egg-info/
+dist/
+build/
+
+# Workflow hdl/fpga-new (make check, make yosys)
+.sim/
+*.fst
+.yosys/
+quartus/de0_cv/*.smsg
+abc.history

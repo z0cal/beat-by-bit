@@ -1,0 +1,112 @@
+# -------------------------------------------------------------------------- #
+#
+# Copyright (C) 2025  Altera Corporation. All rights reserved.
+# Your use of Altera Corporation's design tools, logic functions 
+# and other software and tools, and any partner logic 
+# functions, and any output files from any of the foregoing 
+# (including device programming or simulation files), and any 
+# associated documentation or information are expressly subject 
+# to the terms and conditions of the Altera Program License 
+# Subscription Agreement, the Altera Quartus Prime License Agreement,
+# the Altera IP License Agreement, or other applicable license
+# agreement, including, without limitation, that your use is for
+# the sole purpose of programming logic devices manufactured by
+# Altera and sold by Altera or its authorized distributors.  Please
+# refer to the Altera Software License Subscription Agreements 
+# on the Quartus Prime software download page.
+#
+# -------------------------------------------------------------------------- #
+#
+# Quartus Prime
+# Version 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
+# Date created = 12:05:35  April 07, 2026
+#
+# -------------------------------------------------------------------------- #
+#
+# Notes:
+#
+# 1) The default values for assignments are stored in the file:
+#		beat_by_bit_assignment_defaults.qdf
+#    If this file doesn't exist, see file:
+#		assignment_defaults.qdf
+#
+# 2) Intel recommends that you do not modify this file. This
+#    file is updated automatically by the Quartus Prime software
+#    and any changes you make may be lost or overwritten.
+#
+# -------------------------------------------------------------------------- #
+
+
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CEBA4F23C7
+set_global_assignment -name TOP_LEVEL_ENTITY beat_by_bit
+set_global_assignment -name ORIGINAL_QUARTUS_VERSION 25.1STD.0
+set_global_assignment -name PROJECT_CREATION_TIME_DATE "12:05:35  APRIL 07, 2026"
+set_global_assignment -name LAST_QUARTUS_VERSION "25.1std.0 Lite Edition"
+set_global_assignment -name SDC_FILE ../../constraints/beat_by_bit.sdc
+set_global_assignment -name VERILOG_MACRO "QUARTUS=1"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
+set_global_assignment -name DEVICE_FILTER_PIN_COUNT 484
+set_global_assignment -name DEVICE_FILTER_SPEED_GRADE 7
+set_global_assignment -name ERROR_CHECK_FREQUENCY_DIVISOR 256
+set_global_assignment -name EDA_SIMULATION_TOOL "Questa Altera FPGA (Verilog)"
+set_global_assignment -name EDA_TIME_SCALE "1 ps" -section_id eda_simulation
+set_global_assignment -name EDA_OUTPUT_DATA_FORMAT "VERILOG HDL" -section_id eda_simulation
+set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_timing
+set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_symbol
+set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_signal_integrity
+set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_boundary_scan
+set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
+set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
+set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
+# >>> fpga-sync: fontes de sintese (gerado a partir de rtl/ — nao edite) >>>
+set_global_assignment -name VERILOG_FILE ../../rtl/beat_by_bit_de0_cv.v
+set_global_assignment -name VERILOG_FILE ../../rtl/contador_m.v
+set_global_assignment -name VERILOG_FILE ../../rtl/debounce_pulse.v
+set_global_assignment -name VERILOG_FILE ../../rtl/edge_detector.v
+set_global_assignment -name VERILOG_FILE ../../rtl/fluxo_dados.v
+set_global_assignment -name VERILOG_FILE ../../rtl/gpio_test.v
+set_global_assignment -name VERILOG_FILE ../../rtl/hexa7seg.v
+set_global_assignment -name VERILOG_FILE ../../rtl/lfsr8.v
+set_global_assignment -name VERILOG_FILE ../../rtl/note_track.v
+set_global_assignment -name VERILOG_FILE ../../rtl/packet_sender.v
+set_global_assignment -name VERILOG_FILE ../../rtl/projeto.v
+set_global_assignment -name VERILOG_FILE ../../rtl/registrador_4.v
+set_global_assignment -name VERILOG_FILE ../../rtl/uart_tx.v
+set_global_assignment -name VERILOG_FILE ../../rtl/unidade_controle.v
+# <<< fpga-sync <<<
+set_location_assignment PIN_T20 -to botoes[4]
+set_location_assignment PIN_T18 -to botoes[3]
+set_location_assignment PIN_T15 -to botoes[2]
+set_location_assignment PIN_T19 -to botoes[1]
+set_location_assignment PIN_T17 -to botoes[0]
+set_location_assignment PIN_M9 -to clock
+set_location_assignment PIN_U21 -to db_estado[6]
+set_location_assignment PIN_V21 -to db_estado[5]
+set_location_assignment PIN_W22 -to db_estado[4]
+set_location_assignment PIN_W21 -to db_estado[3]
+set_location_assignment PIN_Y22 -to db_estado[2]
+set_location_assignment PIN_Y21 -to db_estado[1]
+set_location_assignment PIN_AA22 -to db_estado[0]
+set_location_assignment PIN_AA20 -to db_jogada[6]
+set_location_assignment PIN_AB20 -to db_jogada[5]
+set_location_assignment PIN_AA19 -to db_jogada[4]
+set_location_assignment PIN_AA18 -to db_jogada[3]
+set_location_assignment PIN_AB18 -to db_jogada[2]
+set_location_assignment PIN_AA17 -to db_jogada[1]
+set_location_assignment PIN_U22 -to db_jogada[0]
+set_location_assignment PIN_AA2 -to leds_pulsos[4]
+set_location_assignment PIN_AA1 -to leds_pulsos[3]
+set_location_assignment PIN_W2 -to leds_pulsos[2]
+set_location_assignment PIN_Y3 -to leds_pulsos[1]
+set_location_assignment PIN_N2 -to leds_pulsos[0]
+set_location_assignment PIN_N1 -to db_botoes_raw[0]
+set_location_assignment PIN_U2 -to db_botoes_raw[1]
+set_location_assignment PIN_U1 -to db_botoes_raw[2]
+set_location_assignment PIN_L2 -to db_botoes_raw[3]
+set_location_assignment PIN_L1 -to db_botoes_raw[4]
+set_location_assignment PIN_T22 -to reset
+set_location_assignment PIN_N16 -to uart_tx_out
+set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

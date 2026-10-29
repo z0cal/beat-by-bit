@@ -15,6 +15,8 @@
  *   - Debounce + deteccao de borda para os botoes
  *   - Saida song_ok_pulso para selecao de musica na UC (btn0/1/2)
  *   - Registrador song_id_reg para selecionar qual ROM usar
+ *   - Registrador do atenuador de frequencias (eq_config), ajustado
+ *     pelos botoes de trilha no estado SETTINGS
  *-----------------------------------------------------------------------
  * Clock assumido: 50 MHz
  *   frame_tick: M = 833_333 ciclos (= 50MHz / 60fps)
@@ -69,7 +71,10 @@ module fluxo_dados (
     output wire [13:0] frame_counter_out,
 
     // ID da musica selecionada (0=Hobbits, 1=Ocarina, 2=Power Rangers)
-    output wire [1:0]  song_id_out
+    output wire [1:0]  song_id_out,
+
+    // Niveis do atenuador de frequencias (2 bits por faixa, ver eq_config.v)
+    output wire [7:0]  eq_out
 );
 
     // ----------------------------------------------------------------
@@ -102,18 +107,30 @@ module fluxo_dados (
     assign song_ok_pulso = btn_pulse[0] | btn_pulse[1] | btn_pulse[2] | btn_pulse[3];
 
     // Registra qual musica foi selecionada (0=Hobbits, 1=Ocarina, 2=Power Rangers).
-    // Guardado por limpaR=1 (estados idle/select): evita que apertar trilhas
-    // durante o jogo altere a ROM ativa e quebre o chart.
+    // So no estado SELECT: evita que apertar trilhas durante o jogo altere a
+    // ROM ativa, e que o aperto que abre as configuracoes (IDLE) troque a musica.
     reg [1:0] song_id_reg;
     always @(posedge clock or posedge reset) begin
         if (reset)                    song_id_reg <= 2'd0;
-        else if (limpaR) begin
+        else if (db_estado == 4'b0110) begin
             if      (btn_pulse[0])    song_id_reg <= 2'd0;
             else if (btn_pulse[1])    song_id_reg <= 2'd1;
             else if (btn_pulse[2])    song_id_reg <= 2'd2;
             else if (btn_pulse[3])    song_id_reg <= 2'd3;
         end
     end
+
+    // ----------------------------------------------------------------
+    // Atenuador de frequencias: cada trilha avanca o nivel da sua faixa,
+    // so no estado SETTINGS (db_estado == 7)
+    // ----------------------------------------------------------------
+    eq_config u_eq (
+        .clock   (clock),
+        .reset   (reset),
+        .habilita(db_estado == 4'b0111),
+        .pulso   (btn_pulse),
+        .eq      (eq_out)
+    );
 
     // ----------------------------------------------------------------
     // Frame tick: 1 pulso por frame (~60fps)

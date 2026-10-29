@@ -19,6 +19,12 @@ FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
 - **FPGA**: lógica do jogo (FSM, notas, score). Envia pacotes UART de 22 bytes a 60fps.
 - **Python**: renderiza o que recebe via UART. Em `--sim`, roda a FSM localmente sem FPGA.
 - **Teclas (sim)**: D/F/J/K = trilhas 0-3 | SPACE = START/PAUSE | ESC = voltar (pausa)
+- **Configurações de som (estado SETTINGS = 7)**: na tela inicial, qualquer botão de trilha
+  abre o atenuador de frequências; START volta. Lá, cada botão avança o nível da sua faixa
+  (0 → −6 → −12 → −18 dB → 0): D = graves (< 250 Hz), F = médios (250 Hz–2 kHz),
+  J = agudos (2–6 kHz), K = brilho (> 6 kHz). A FPGA guarda os níveis (`eq_config.v`, zeram
+  só no reset) e os envia no pacote; o PC filtra o WAV por FFT (`_eq_wav_bytes`) e toca uma
+  prévia de 10 s em loop enquanto o jogador ajusta.
 
 ---
 
@@ -36,11 +42,30 @@ Arquivos MIDI: `songs/condado/condado_curta.mid`, `songs/ocarina/Ocarina_curta.m
 
 Charts `.hex` gerados automaticamente em `rtl/` no startup do SimulationEngine: `condado_curta.hex`, `ocarina_curta.hex`, `power_rangers.hex`. Esses arquivos são necessários para o Quartus (`$readmemh`).
 
-**Algoritmo de geração de chart** (`_midi_to_chart`):
-- Mapeamento de pitch → lane por **quartis** do MIDI atual (não thresholds fixos) — distribui ~25% das notas em cada lane
-- Agrupamento por frame + escolha do lane **menos recentemente usado** ao resolver colisões simultâneas — garante que todos os 4 lanes recebam notas
-- Usa apenas `_MIN_NOTE_SPACING` (espaçamento por trilha) e `_MAX_SIMULTANEOUS`; `_GLOBAL_SPACING` não é mais aplicado no gerador de chart
-- `_DIFF_PRESETS["facil"] = (50, 18, 1)` — min_lane=50 (≈0.83s entre notas na mesma lane), max_sim=1
+**Algoritmo de geração de chart** (`_midi_to_chart`, regerar com `uv run python pc/gerar_hex.py`):
+- **Foco na melodia:** cada música declara em `SONGS` os canais MIDI da melodia (`"melody"`).
+  Em acordes, fica só a nota mais aguda (skyline). Quando a melodia some por mais de 2,5 s, a
+  voz mais aguda do acompanhamento preenche a lacuna. A bateria (canal 9) nunca entra.
+- **Trilha pela altura:** quartis das alturas que levam empates em conta (a melodia "sobe" para a
+  direita). Se a trilha preferida estiver ocupada, a nota vai para a vizinha livre mais próxima.
+- **Quantidade:** `CHART_NOTE_FACTOR` (0,65) × `ref_notes` (notas do chart antigo). As notas
+  entram por prioridade: cabeça de compasso > tempo > colcheia; melodia antes de preenchimento;
+  notas longas antes das curtas.
+- **Restrições:** espaçamento global e por trilha do preset de dificuldade, e 3 slots por trilha
+  (quaisquer 4 notas seguidas na mesma trilha ocupam ≥ 152 frames).
+- Quando a melodia não tem notas jogáveis suficientes no espaçamento do preset, o chart fica abaixo
+  do alvo (Hobbits e Pokémon no "fácil").
+- `_DIFF_PRESETS["facil"] = (60, 30, 1)`: 60 frames (1 s) entre notas da mesma trilha e 30
+  (0,5 s) entre quaisquer notas; max_sim não se aplica (a melodia é monofônica).
+
+**Sincronia chart × áudio:**
+- Os WAVs são renderizações dos MIDIs: alinhados, sem deriva (medido por correlação de onsets).
+- No `--sim`, a simulação avança pelo relógio de parede (`time.perf_counter`), 1 passo a cada
+  1/60 s, como o `frame_tick` da FPGA. Não conta frames renderizados: `clock.tick(60)` roda a
+  ~59 fps e as notas atrasavam ~1 s ao fim da música.
+- `--audio-offset MS` compensa latência extra da saída de áudio (ex.: 200 para fone Bluetooth;
+  negativo se as notas chegam depois do som). O buffer do mixer já é compensado no chart por
+  `AUDIO_LATENCY_FRAMES`.
 
 ---
 
@@ -89,13 +114,14 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 Pacote de 22 bytes a 60fps:
 ```
 [0]  = 0x55 (header)
-[1]  = state (4 bits baixos): 0=idle,1=countdown,2=play,3=pause,4=win,5=lose,6=select
-[2]  = countdown_sec (3,2,1,0)
+[1]  = {eq[3:0], state}: state nos 4 bits baixos (0=idle,1=countdown,2=play,3=pause,
+       4=win,5=lose,6=select,7=settings); bits 5:4 = graves, 7:6 = médios
+[2]  = {eq[7:4], countdown_sec[3:0]}: countdown 3,2,1,0; bits 5:4 = agudos, 7:6 = brilho
 [3..14] = ages das notas: 4 trilhas × 3 slots × 1 byte (0xFF = slot vazio)
 [15..16] = score (16 bits big-endian)
 [17] = misses
 [18] = combo
-[19..20] = frame_counter (14 bits: [19]bits13-8, [20]bits7-0)
+[19..20] = song_id ([19] bits 7-6) + frame_counter (14 bits: [19]bits13-8, [20]bits7-0)
 [21] = 0xAA (footer)
 ```
 
@@ -104,7 +130,8 @@ Pacote de 22 bytes a 60fps:
 ## Como rodar
 
 ```bash
-python pc/interface.py --sim          # modo simulação (sem FPGA)
+uv run pc/interface.py --sim          # modo simulação (sem FPGA)
+uv run --extra fpga pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
 python pc/interface.py --port COM3    # modo FPGA (Windows)
 python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 ```
@@ -113,7 +140,7 @@ python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 
 ## Dependências Python
 
-`pygame`, `mido`, `pyserial` (opcional, apenas modo FPGA)
+`pygame`, `mido`, `numpy` (atenuador), `pyserial` (opcional, apenas modo FPGA)
 
 ---
 
@@ -132,7 +159,8 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | Arquivo | Papel |
 |---------|-------|
 | `projeto.v` | Top-level, instancia UC + FD + packet_sender |
-| `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose) |
+| `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose; idle↔settings) |
+| `eq_config.v` | Níveis do atenuador de frequências (2 bits por faixa) |
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
 | `packet_sender.v` | Serializa estado em pacote UART |
 | `note_track.v` | 1 trilha com 3 slots de nota |

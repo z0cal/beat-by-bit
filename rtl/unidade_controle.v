@@ -13,9 +13,12 @@
  *   0100 = end_win   Vitoria (fim do chart sem 10 erros)
  *   0101 = end_lose  Derrota (10 erros)
  *   0110 = select    Selecao de musica
+ *   0111 = settings  Configuracoes de som (atenuador de frequencias)
  *
  * Transicoes:
  *   idle    --(START)--> select
+ *   idle    --(song_ok/qualquer trilha)--> settings
+ *   settings --(START)--> idle
  *   select  --(song_ok/botao0)--> countdown
  *   select  --(START)--> idle
  *   countdown --(fim_contagem)--> play
@@ -52,6 +55,7 @@ module unidade_controle (
     localparam end_win   = 4'b0100;
     localparam end_lose  = 4'b0101;
     localparam select    = 4'b0110;
+    localparam settings  = 4'b0111;
 
     reg [3:0] Eatual, Eprox;
 
@@ -62,7 +66,10 @@ module unidade_controle (
 
     always @* begin
         case (Eatual)
-            idle:      Eprox = start    ? select    : idle;
+            idle:      Eprox = start    ? select    :
+                               song_ok  ? settings  : idle;
+            // Em settings os botoes de trilha so ajustam o eq (FD); START sai
+            settings:  Eprox = start    ? idle      : settings;
             select:    Eprox = song_ok  ? countdown :
                                start    ? idle      : select;
             countdown: Eprox = fim_contagem ? play : countdown;
@@ -78,13 +85,14 @@ module unidade_controle (
     end
 
     always @* begin
-        // Timers zerados em idle, select, end_win e end_lose
-        zera_timer  = (Eatual == idle || Eatual == select ||
+        // Timers zerados em idle, select, settings, end_win e end_lose
+        zera_timer  = (Eatual == idle || Eatual == select || Eatual == settings ||
                        Eatual == end_win || Eatual == end_lose) ? 1'b1 : 1'b0;
         conta_timer = (Eatual == countdown || Eatual == play) ? 1'b1 : 1'b0;
         game_active = (Eatual == play) ? 1'b1 : 1'b0;
-        // Registros limpos em idle e select (antes de comecar a musica)
-        limpaR      = (Eatual == idle || Eatual == select) ? 1'b1 : 1'b0;
+        // Registros limpos em idle, select e settings (antes de comecar a musica)
+        limpaR      = (Eatual == idle || Eatual == select ||
+                       Eatual == settings) ? 1'b1 : 1'b0;
         registraR   = (Eatual == play && jogada) ? 1'b1 : 1'b0;
         db_estado   = Eatual;
     end

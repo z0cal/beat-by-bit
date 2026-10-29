@@ -40,6 +40,7 @@ module beat_by_bit (
     wire        s_frame_tick;
     wire [13:0] s_frame_counter;
     wire [1:0]  s_song_id;
+    wire [7:0]  s_eq;
 
     assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_perdeu, s_jogada_feita};
 
@@ -96,7 +97,8 @@ module beat_by_bit (
         .combo         (s_combo),
         .frame_tick_out    (s_frame_tick),
         .frame_counter_out (s_frame_counter),
-        .song_id_out       (s_song_id)
+        .song_id_out       (s_song_id),
+        .eq_out            (s_eq)
     );
 
     // ----------------------------------------------------------------
@@ -117,6 +119,7 @@ module beat_by_bit (
         .combo         (s_combo),
         .frame_counter (s_frame_counter),
         .song_id       (s_song_id),
+        .eq            (s_eq),
         .uart_tx_out   (uart_tx_out)
     );
 

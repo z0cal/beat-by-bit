@@ -6,8 +6,11 @@ Nenhuma logica de jogo aqui — tudo roda na FPGA (Verilog).
 Protocolo UART (115200 baud, 8N1):
   Pacote de 22 bytes a ~60fps:
     [0]  0x55              marcador de inicio
-    [1]  state             0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
-    [2]  countdown_sec     3,2,1,0
+    [1]  {eq_lo, state}    state (bits 3:0): 0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE
+                           4=WIN 5=LOSE 6=SELECT 7=SETTINGS
+                           bits 5:4 = GRAVES, bits 7:6 = MEDIOS
+    [2]  {eq_hi, countdown} countdown (bits 3:0): 3,2,1,0
+                           bits 5:4 = AGUDOS, bits 7:6 = BRILHO
     [3-5]  trilha 0 — ages das 3 notas (0xFF = vazio)
     [6-8]  trilha 1
     [9-11] trilha 2
@@ -16,11 +19,13 @@ Protocolo UART (115200 baud, 8N1):
     [16] score low byte
     [17] misses (0-10)
     [18] combo
-    [19] frame_counter[13:8]  (6 bits altos)
+    [19] {song_id, frame_counter[13:8]}  (2 + 6 bits)
     [20] frame_counter[7:0]   (8 bits baixos)
     [21] 0xAA              marcador de fim
 
 Conversao age -> Y: y = age * NOTE_SPEED  (NOTE_SPEED=4)
+
+Niveis do atenuador (eq): 0=0 dB, 1=-6 dB, 2=-12 dB, 3=-18 dB por faixa.
 """
 
 import pygame
@@ -29,19 +34,28 @@ import pygame
 # Maior buffer = menos crackling em maquinas lentas, mas mais latencia.
 # 16384 @ 44100Hz ≈ 371ms ≈ 22 frames a 60fps — compensado no chart (AUDIO_LATENCY_FRAMES).
 _AUDIO_BUFFER = 4096
+# Passos que a simulacao recupera de uma vez (10 s). Recupera tudo para nao
+# perder a sincronia com o audio; acima disso (ex.: maquina suspensa) reancora.
+_SIM_MAX_CATCHUP = 600
 
 # pre_init DEVE ser chamado antes de pygame.init() para garantir as configuracoes
 # corretas do mixer desde o inicio (evita double-init e distorcao em algumas maquinas).
 pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=_AUDIO_BUFFER)
 pygame.init()
 
+import io
 import threading
+import time
+from collections import Counter
 import queue
+import wave
 import argparse
 import math
 import random
 import os
 from sys import exit
+
+import numpy as np
 
 try:
     import serial
@@ -109,6 +123,7 @@ STATE_PAUSE = 3
 STATE_WIN = 4
 STATE_LOSE = 5
 STATE_SONG_SELECT = 6
+STATE_SETTINGS = 7
 
 # Caminhos resolvidos a partir deste arquivo (independe do diretorio atual)
 _PC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +145,9 @@ SONGS = [
         "duration": 63.86,
         "hex": os.path.join(_RTL_DIR, "condado_curta.hex"),
         "available": True,
+        # Melodia: flauta doce (canal 1) ate ~25 s, depois a linha aguda do canal 2
+        "melody": [1, 2],
+        "ref_notes": 139,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
     {
         "title": "Song of Storms",
@@ -140,6 +158,9 @@ SONGS = [
         "duration": 70.33,
         "hex": os.path.join(_RTL_DIR, "ocarina_curta.hex"),
         "available": True,
+        # Melodia: clarinete (canal 1); o violino (canal 0) so dobra a mesma linha
+        "melody": [1],
+        "ref_notes": 88,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
     {
         "title": "Power Rangers",
@@ -150,6 +171,9 @@ SONGS = [
         "duration": 64.67,
         "hex": os.path.join(_RTL_DIR, "power_rangers.hex"),
         "available": True,
+        # Melodia: riff da guitarra (canal 2); o canal 0 e o baixo
+        "melody": [2],
+        "ref_notes": 132,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
     {
         "title": "Pokemon",
@@ -160,6 +184,9 @@ SONGS = [
         "duration": 61.98,
         "hex": os.path.join(_RTL_DIR, "pokemon.hex"),
         "available": True,
+        # Melodia: trompete 1 na introducao (canal 0), depois trompete 2 (canal 3)
+        "melody": [0, 3],
+        "ref_notes": 168,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
 ]
 
@@ -167,6 +194,81 @@ PACKET_SIZE = 22
 PKT_HEADER = 0x55
 PKT_FOOTER = 0xAA
 EMPTY_SLOT = 0xFF
+
+# ─── Atenuador de frequencias (tela de configuracoes) ────────────────────────
+# Uma faixa por botao de trilha. Na tela de configuracoes, cada aperto avanca o
+# nivel da faixa (0 -> 1 -> 2 -> 3 -> 0). A FPGA guarda os niveis (eq_config.v)
+# e o PC aplica a atenuacao no audio antes de tocar.
+EQ_BANDS = [
+    {"name": "GRAVES", "range": "ate 250 Hz"},
+    {"name": "MEDIOS", "range": "250 Hz a 2 kHz"},
+    {"name": "AGUDOS", "range": "2 a 6 kHz"},
+    {"name": "BRILHO", "range": "acima de 6 kHz"},
+]
+EQ_CROSSOVERS = (250.0, 2000.0, 6000.0)  # Hz, fronteiras entre as faixas
+EQ_LEVELS = 4
+EQ_STEP_DB = 6
+EQ_PREVIEW_S = 10.0  # trecho tocado em loop na tela de configuracoes
+EQ_FADE_S = 0.05  # fade nas pontas da previa (evita clique na emenda do loop)
+
+
+def _eq_gain_curve(freqs, eq):
+    """Ganho linear por frequencia para os niveis eq[0..3] (ver EQ_BANDS)."""
+    gains_db = [-EQ_STEP_DB * lvl for lvl in eq]
+    x = np.log2(np.maximum(freqs, 1.0))
+    curve_db = np.full(x.shape, float(gains_db[0]))
+    for k, fc in enumerate(EQ_CROSSOVERS):
+        # Transicao em cosseno de 1 oitava centrada na fronteira: sem degrau
+        # no espectro, logo sem ringing audivel
+        t = np.clip(x - math.log2(fc) + 0.5, 0.0, 1.0)
+        curve_db += (gains_db[k + 1] - gains_db[k]) * (0.5 - 0.5 * np.cos(np.pi * t))
+    return 10.0 ** (curve_db / 20.0)
+
+
+def _apply_eq(samples, rate, eq):
+    """Aplica o atenuador no dominio da frequencia. samples: (n, canais) float."""
+    n = samples.shape[0]
+    spec = np.fft.rfft(samples, axis=0)
+    spec *= _eq_gain_curve(np.fft.rfftfreq(n, 1.0 / rate), eq)[:, None]
+    return np.fft.irfft(spec, n=n, axis=0)
+
+
+def _eq_wav_bytes(path, eq, preview_s=None):
+    """
+    Le o WAV (16 bits, mono ou estereo), aplica o atenuador e devolve um WAV em
+    memoria. Com preview_s, usa so um trecho dessa duracao do meio da musica,
+    com fade nas pontas para tocar em loop.
+    """
+    with wave.open(path, "rb") as w:
+        ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+        n = w.getnframes()
+        if width != 2:
+            raise ValueError(f"WAV de {8 * width} bits; so 16 bits e suportado")
+        first, count = 0, n
+        if preview_s is not None:
+            count = min(n, int(preview_s * rate))
+            first = (n - count) // 2
+        w.setpos(first)
+        pcm = np.frombuffer(w.readframes(count), dtype="<i2").reshape(-1, ch)
+
+    out = pcm.astype(np.float64)
+    if any(eq):
+        out = _apply_eq(out, rate, eq)
+    if preview_s is not None:
+        fade = min(len(out) // 2, int(EQ_FADE_S * rate))
+        if fade:
+            ramp = np.linspace(0.0, 1.0, fade)[:, None]
+            out[:fade] *= ramp
+            out[-fade:] *= ramp[::-1]
+    pcm = np.clip(np.rint(out), -32768, 32767).astype("<i2")
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
 
 
 # ─── Thread Serial ────────────────────────────────────────────────────────────
@@ -224,7 +326,7 @@ class SerialReader(threading.Thread):
 
 def parse_packet(data, offset):
     """
-    Tenta interpretar um pacote de 20 bytes a partir de 'offset' em 'data'.
+    Tenta interpretar um pacote de 22 bytes a partir de 'offset' em 'data'.
     Retorna um dict com o estado do jogo, ou None se invalido.
     """
     if offset + PACKET_SIZE > len(data):
@@ -233,7 +335,14 @@ def parse_packet(data, offset):
         return None
 
     state = data[offset + 1] & 0x0F
-    countdown = data[offset + 2]
+    countdown = data[offset + 2] & 0x0F
+    # Niveis do atenuador nos nibbles altos dos bytes 1 e 2 (eq_config.v)
+    eq = [
+        (data[offset + 1] >> 4) & 0x03,
+        (data[offset + 1] >> 6) & 0x03,
+        (data[offset + 2] >> 4) & 0x03,
+        (data[offset + 2] >> 6) & 0x03,
+    ]
     notes = []
     for t in range(4):
         track_notes = []
@@ -257,6 +366,7 @@ def parse_packet(data, offset):
         "combo": combo,
         "frame_counter": frame_counter,
         "song_id": song_id,
+        "eq": eq,
     }
 
 
@@ -276,8 +386,6 @@ def find_packet(buf):
 
 # ─── Chart: gerado do MIDI real ───────────────────────────────────────────────
 
-_MIDI_PATH = os.path.join(_SONGS_DIR, "condado", "condado_curta.mid")
-_WAV_SRC_PATH = os.path.join(_SONGS_DIR, "condado", "Condado_curta.wav")
 _WAV_DURATION = 63.86  # segundos
 
 # ─── Dificuldade ──────────────────────────────────────────────────────────────
@@ -286,102 +394,203 @@ DIFFICULTY = "facil"
 
 _DIFF_PRESETS = {
     #              min_lane  global  max_sim
-    "facil": (50, 18, 1),
+    "facil": (60, 30, 1),
     "medio": (30, 10, 2),
     "dificil": (15, 5, 4),
 }
 _MIN_NOTE_SPACING, _GLOBAL_SPACING, _MAX_SIMULTANEOUS = _DIFF_PRESETS[DIFFICULTY]
 
 
+# ─── Chart: melodia ───────────────────────────────────────────────────────────
+# O chart segue a melodia (canais "melody" de cada musica), nao a harmonia.
+# Onde a melodia fica em silencio por mais de _MELODY_GAP_S, a voz mais aguda do
+# acompanhamento preenche. A bateria (canal 9) nunca entra.
+CHART_NOTE_FACTOR = 0.65  # notas mantidas = ref_notes * fator (0.65 = 35% menos)
+_MELODY_GAP_S = 2.5  # silencio da melodia a partir do qual o acompanhamento preenche
+_FILL_MARGIN_S = 0.5  # distancia minima entre preenchimento e nota da melodia
+_CHORD_S = 0.04  # onsets mais proximos que isso contam como um acorde
+_DRUM_CHANNEL = 9
+_LANE_SLOT_SPAN = 152  # 4 notas seguidas na trilha precisam caber em 3 slots (MISS_AGE + 1)
+
+
+def _midi_notes(midi_path):
+    """
+    Le todas as notas do MIDI. Cada nota: t (s), dur (s), pitch, vel, ch e
+    metric (peso no compasso: 3 = cabeca, 2 = tempo, 1 = colcheia, 0 = resto).
+    """
+    import mido
+
+    mid = mido.MidiFile(midi_path)
+    tpb = mid.ticks_per_beat
+    tempo, tick, t = 500_000, 0, 0.0
+    num, den, bar_origin = 4, 4, 0
+    opened, notes = {}, []
+
+    def metric(tk):
+        beat = tpb * 4 // den
+        pos = (tk - bar_origin) % (beat * num)
+        tol = max(1, beat // 16)  # MIDIs exportados nem sempre estao quantizados
+
+        def on_grid(step):
+            r = pos % step
+            return min(r, step - r) <= tol
+
+        if min(pos, beat * num - pos) <= tol:
+            return 3
+        if on_grid(beat):
+            return 2
+        if on_grid(beat // 2):
+            return 1
+        return 0
+
+    # merge_tracks mantem msg.time em ticks: precisamos deles para o compasso
+    for msg in mido.merge_tracks(mid.tracks):
+        if msg.time:
+            t += mido.tick2second(msg.time, tpb, tempo)
+            tick += msg.time
+        if msg.type == "set_tempo":
+            tempo = msg.tempo
+        elif msg.type == "time_signature":
+            num, den, bar_origin = msg.numerator, msg.denominator, tick
+        elif msg.type == "note_on" and msg.velocity > 0:
+            n = {"t": t, "dur": 0.0, "pitch": msg.note, "vel": msg.velocity,
+                 "ch": msg.channel, "metric": metric(tick)}
+            opened[(msg.channel, msg.note)] = n
+            notes.append(n)
+        elif msg.type in ("note_off", "note_on"):
+            n = opened.pop((msg.channel, msg.note), None)
+            if n:
+                n["dur"] = t - n["t"]
+    return notes
+
+
+def _skyline(notes):
+    """Uma nota por onset: a mais aguda de cada acorde (a melodia fica no topo)."""
+    out = []
+    for n in sorted(notes, key=lambda n: n["t"]):
+        if out and n["t"] - out[-1]["t"] < _CHORD_S:
+            if n["pitch"] > out[-1]["pitch"]:
+                out[-1] = n
+        else:
+            out.append(n)
+    return out
+
+
+def _melody_candidates(notes, melody_channels, duration):
+    """Melodia (skyline) + preenchimento das lacunas, dentro do audio."""
+    inside = [n for n in notes if 0.0 <= n["t"] <= duration]
+    if melody_channels:
+        melody = _skyline([n for n in inside if n["ch"] in melody_channels])
+    else:
+        melody = []
+    for n in melody:
+        n["fill"] = False
+
+    # Lacunas da melodia (inclui inicio e fim da musica)
+    marks = [-_MELODY_GAP_S] + [n["t"] for n in melody] + [duration + _MELODY_GAP_S]
+    gaps = [
+        (a + _FILL_MARGIN_S, b - _FILL_MARGIN_S)
+        for a, b in zip(marks, marks[1:])
+        if b - a > _MELODY_GAP_S
+    ]
+    accomp = _skyline(
+        [
+            n
+            for n in inside
+            if n["ch"] != _DRUM_CHANNEL and n["ch"] not in melody_channels
+        ]
+    )
+    fill = [n for n in accomp if any(a <= n["t"] <= b for a, b in gaps)]
+    for n in fill:
+        n["fill"] = True
+    return melody + fill
+
+
 def _midi_to_chart(song_config=None, save_hex=False):
     """
     Le o MIDI e retorna lista de bitmasks por frame (60 fps).
     Se save_hex=True, tambem grava o arquivo .hex da musica.
-    song_config: entrada do array SONGS (com campos 'midi', 'duration', 'hex').
-                 Se None, usa os defaults globais (_MIDI_PATH, _WAV_DURATION).
+    song_config: entrada do array SONGS. Se None, usa SONGS[0].
 
-    Mapeamento de lanes: adaptativo por quartis do pitch do proprio MIDI,
-    garantindo distribuicao balanceada nas 4 lanes independente da musica.
+    1. Candidatas: a melodia da musica (song_config["melody"]) e, nas lacunas
+       dela, a voz mais aguda do acompanhamento.
+    2. Trilha pela altura: quartis das alturas das candidatas, entao a melodia
+       "sobe" para a direita. Se a trilha preferida estiver ocupada (espacamento
+       ou slots), a nota vai para a trilha livre mais proxima dela.
+    3. Selecao por prioridade, ate ref_notes * CHART_NOTE_FACTOR notas: primeiro
+       cabeca de compasso, depois tempos, colcheias; melodia antes do
+       preenchimento; notas longas antes das curtas. Cada nota so entra se
+       respeitar o espacamento global e por trilha do preset de dificuldade e
+       os 3 slots por trilha do hardware.
     """
-    import mido
-
-    midi_path = song_config["midi"] if song_config else _MIDI_PATH
-    duration = song_config["duration"] if song_config else _WAV_DURATION
-    hex_name = song_config["hex"] if song_config else os.path.join(_RTL_DIR, "condado_curta.hex")
-
-    mid = mido.MidiFile(midi_path)
-    t_sec = 0.0
-    raw_events = []  # (time_sec, pitch)
-
-    # Ao iterar sobre o MidiFile diretamente, mido mergeia todas as tracks
-    # e retorna msg.time em segundos (delta) — nao precisa de tick2second.
-    for msg in mid:
-        t_sec += msg.time
-        if msg.type == "note_on" and msg.velocity > 0:
-            raw_events.append((t_sec, msg.note))
-
-    # Mapeamento adaptativo: divide o range de pitches em quartis para
-    # distribuir as notas igualmente entre as 4 lanes.
-    if raw_events:
-        pitches = sorted(p for _, p in raw_events)
-        n = len(pitches)
-        b0 = pitches[n // 4]  # limite superior da lane 0
-        b1 = pitches[n // 2]  # limite superior da lane 1
-        b2 = pitches[3 * n // 4]  # limite superior da lane 2
-
-        def _pitch_to_lane(p):
-            if p <= b0:
-                return 0
-            if p <= b1:
-                return 1
-            if p <= b2:
-                return 2
-            return 3
-    else:
-
-        def _pitch_to_lane(p):
-            return 0
-
+    song_config = song_config or SONGS[0]
+    duration = song_config["duration"]
     total_frames = int(duration * FPS)  # igual ao ROM_DEPTH correspondente no Verilog
 
-    # Agrupar eventos por frame: quando notas simultaneas colidem, escolhe o
-    # lane menos recentemente usado — garante distribuicao balanceada em todas as musicas.
+    cands = _melody_candidates(
+        _midi_notes(song_config["midi"]), song_config.get("melody", []), duration
+    )
+
     # AUDIO_LATENCY_FRAMES compensa o atraso do buffer de audio: sem ele, as notas
     # chegam na hit zone antes do som correspondente sair pelos alto-falantes.
-    from collections import defaultdict
+    for n in cands:
+        n["frame"] = int(n["t"] * FPS) - int(HIT_AGE) + AUDIO_LATENCY_FRAMES
+    cands = [n for n in cands if 0 <= n["frame"] < total_frames]
 
-    frame_map = defaultdict(list)
-    for t, note in raw_events:
-        f = int(t * FPS) - int(HIT_AGE) + AUDIO_LATENCY_FRAMES
-        if 0 <= f < total_frames:
-            frame_map[f].append(_pitch_to_lane(note))
+    # Quartis com empates: cada altura vai para a trilha do ponto medio da sua
+    # fatia na distribuicao acumulada. Altura repetida nao lota uma trilha so.
+    counts = Counter(n["pitch"] for n in cands)
+    lane_of, below = {}, 0
+    for p in sorted(counts):
+        mid = (below + counts[p] / 2) / len(cands)
+        lane_of[p] = min(3, int(mid * 4))
+        below += counts[p]
+    for n in cands:
+        n["lane"] = lane_of[n["pitch"]]
+
+    ref = song_config.get("ref_notes", len(cands))
+    target = round(ref * CHART_NOTE_FACTOR)
+
+    def fits(frames, f, spacing):
+        return all(abs(f - g) >= spacing for g in frames)
+
+    def slots_ok(frames, f):
+        seq = sorted(frames + [f])
+        i = seq.index(f)
+        return all(
+            seq[j + 3] - seq[j] >= _LANE_SLOT_SPAN
+            for j in range(max(0, i - 3), min(i, len(seq) - 4) + 1)
+        )
+
+    # Notas monofonicas: _MAX_SIMULTANEOUS nao se aplica (o skyline ja tirou acordes)
+    chosen, by_lane = [], [[] for _ in range(4)]
+    for n in sorted(cands, key=lambda n: (n["metric"], not n["fill"], n["dur"]), reverse=True):
+        if len(chosen) >= target:
+            break
+        f = n["frame"]
+        if not fits(chosen, f, _GLOBAL_SPACING):
+            continue
+        # Trilha preferida primeiro, depois as vizinhas por distancia
+        for lane in sorted(range(4), key=lambda l: (abs(l - n["lane"]), l)):
+            if fits(by_lane[lane], f, _MIN_NOTE_SPACING) and slots_ok(by_lane[lane], f):
+                chosen.append(f)
+                by_lane[lane].append(f)
+                break
 
     rom = [0] * total_frames
-    last_frame = [-_MIN_NOTE_SPACING] * 4  # ultimo frame aceito por trilha
-
-    for f in sorted(frame_map.keys()):
-        # Candidatos: lanes presentes neste frame que respeitam o espacamento por trilha
-        seen = {}
-        for lane in frame_map[f]:
-            if lane not in seen:
-                seen[lane] = lane
-        candidates = [
-            lane for lane in seen if f - last_frame[lane] >= _MIN_NOTE_SPACING
-        ]
-        if not candidates:
-            continue
-        # Ordenar por uso mais antigo primeiro (garante rotacao entre lanes)
-        candidates.sort(key=lambda l: last_frame[l])
-        for lane in candidates[:_MAX_SIMULTANEOUS]:
+    for lane, frames in enumerate(by_lane):
+        for f in frames:
             rom[f] |= 1 << lane
-            last_frame[lane] = f
 
     if save_hex:
-        with open(hex_name, "w") as fh:
+        with open(song_config["hex"], "w") as fh:
             for v in rom:
                 fh.write(f"{v:02X}\n")
-        notes = sum(1 for v in rom if v)
-        print(f"[chart] {hex_name} gerado: {len(rom)} frames, {notes} notas")
+        print(
+            f"[chart] {song_config['hex']} gerado: {len(rom)} frames, {len(chosen)} notas "
+            f"(alvo {target}, {sum(not n['fill'] for n in cands)} da melodia + "
+            f"{sum(n['fill'] for n in cands)} de preenchimento candidatas)"
+        )
 
     return rom
 
@@ -408,6 +617,8 @@ class SimulationEngine:
         self.misses = 0
         self.combo = 0
         self._selected_song = 0
+        # Niveis do atenuador: como o eq_config da FPGA, so zeram no reset
+        self._eq = [0] * 4
         # Pre-gera charts de todas as musicas disponíveis e grava os .hex no disco
         self._charts = [
             _midi_to_chart(s, save_hex=True) for s in SONGS if s["available"]
@@ -448,6 +659,7 @@ class SimulationEngine:
             "combo": self.combo,
             "frame_counter": self._chart_frame,
             "song_id": self._selected_song,
+            "eq": list(self._eq),
         }
 
     # ── FSM ──────────────────────────────────────────────────────────────────
@@ -457,6 +669,15 @@ class SimulationEngine:
         if self.state == STATE_IDLE:
             if start:
                 self.state = STATE_SONG_SELECT
+            elif any(btn[:4]):
+                self.state = STATE_SETTINGS
+        elif self.state == STATE_SETTINGS:
+            if start:
+                self.state = STATE_IDLE
+            else:
+                for i in range(4):
+                    if btn[i]:
+                        self._eq[i] = (self._eq[i] + 1) % EQ_LEVELS
         elif self.state == STATE_SONG_SELECT:
             if start:
                 self.state = STATE_IDLE
@@ -558,9 +779,29 @@ class SimulationEngine:
 
 
 class Renderer:
-    def __init__(self, serial_port="/dev/ttyUSB0", baudrate=115200, sim_mode=False):
+    def __init__(
+        self,
+        serial_port="/dev/ttyUSB0",
+        baudrate=115200,
+        sim_mode=False,
+        scale=None,
+        audio_offset_ms=0,
+    ):
         self._sim_mode = sim_mode
-        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        # Latencia de saida alem do buffer do mixer (fone Bluetooth, placa de
+        # som externa). Positivo: a musica comeca adiantada esse tanto para
+        # compensar; negativo: a musica comeca atrasada.
+        self._audio_offset = audio_offset_ms / 1000.0
+        self._music_start_at = None  # perf_counter em que play() deve rodar
+        # Jogo sempre desenha em SCREEN_W x SCREEN_H (HIT_AGE depende disso);
+        # _present() escala esse frame para a janela, que e redimensionavel.
+        if scale is None:
+            desk_w, desk_h = pygame.display.get_desktop_sizes()[0]
+            scale = min(1.0, 0.9 * desk_w / SCREEN_W, 0.9 * desk_h / SCREEN_H)
+        self.window = pygame.display.set_mode(
+            (int(SCREEN_W * scale), int(SCREEN_H * scale)), pygame.RESIZABLE
+        )
+        self.screen = pygame.Surface((SCREEN_W, SCREEN_H)).convert()
         pygame.display.set_caption("Beat by Bit" + (" [SIM]" if sim_mode else ""))
         self.clock = pygame.time.Clock()
         self._font_cache = {}
@@ -575,6 +816,13 @@ class Renderer:
         self.fpga_frame_counter = 0
         self.fpga_song_id = 0
         self._selected_song = 0
+        self._eq = [0, 0, 0, 0]  # niveis do atenuador (FPGA ou simulacao)
+
+        # Audio carregado no mixer: (musica, eq, previa). WAVs filtrados ficam
+        # em memoria (nada e gravado em disco) num cache pequeno.
+        self._loaded_audio = None
+        self._audio_cache = {}
+        self._music_buf = None
 
         # Efeitos visuais tipados
         self._hit_effects = []  # burst de acerto
@@ -589,6 +837,9 @@ class Renderer:
         if sim_mode:
             self.sim = SimulationEngine()
             self.serial = None
+            self._sim_t0 = None  # perf_counter do 1o passo da simulacao
+            self._sim_steps = 0
+            self._sim_btn = [False] * 5
             self._sim_song_ms = int(_WAV_DURATION * 1000)
         else:
             self.serial = SerialReader(port=serial_port, baudrate=baudrate)
@@ -619,18 +870,48 @@ class Renderer:
 
     # ── Musica ────────────────────────────────────────────────────────────────
 
+    _AUDIO_CACHE_MAX = 8
+
     def _init_music(self):
-        """Carrega a musica da song selecionada."""
+        """Carrega a musica selecionada, ja com o atenuador aplicado."""
+        self._load_audio(preview=False)
+
+    def _load_audio(self, preview):
+        """
+        Carrega no mixer a musica selecionada filtrada por self._eq. Com
+        preview=True, carrega so o trecho em loop da tela de configuracoes.
+        """
         self._music_ok = False
         self._music_paused = False
-
+        key = (self._selected_song, tuple(self._eq), preview)
+        self._loaded_audio = key
         path = SONGS[self._selected_song]["audio"]
 
+        source = path
+        if preview or any(self._eq):
+            data = self._audio_cache.get(key)
+            if data is None:
+                try:
+                    data = _eq_wav_bytes(path, self._eq, EQ_PREVIEW_S if preview else None)
+                except Exception as e:
+                    print(f"[music] Atenuador indisponivel, tocando original: {e}")
+                if data is not None:
+                    if len(self._audio_cache) >= self._AUDIO_CACHE_MAX:
+                        self._audio_cache.pop(next(iter(self._audio_cache)))
+                    self._audio_cache[key] = data
+            if data is not None:
+                # O mixer le o arquivo aos poucos: a referencia precisa viver
+                self._music_buf = io.BytesIO(data)
+                source = self._music_buf
+
         try:
-            pygame.mixer.music.load(path)
+            if source is path:
+                pygame.mixer.music.load(path)
+            else:
+                pygame.mixer.music.load(source, "wav")
             pygame.mixer.music.set_volume(0.70)
             self._music_ok = True
-            print(f"[music] Carregado: {path}")
+            print(f"[music] Carregado: {path} eq={self._eq}{' (previa)' if preview else ''}")
         except Exception as e:
             print(f"[music] Falha ao carregar musica: {e}")
 
@@ -641,16 +922,33 @@ class Renderer:
 
     def _update_music(self, state):
         """Controla reproducao com base no estado do jogo."""
+        # Troca o audio quando musica ou eq mudam, ou ao entrar/sair da previa.
+        # Nunca em PLAY/PAUSE: la o eq e a musica estao fixos.
+        wanted = (self._selected_song, tuple(self._eq), state == STATE_SETTINGS)
+        if wanted != self._loaded_audio and state not in (STATE_PLAY, STATE_PAUSE):
+            pygame.mixer.music.stop()
+            self._load_audio(preview=wanted[2])
         if not self._music_ok:
             return
         playing = pygame.mixer.music.get_busy()
-        if state == STATE_PLAY:
+        if state == STATE_SETTINGS:
+            if not playing:
+                pygame.mixer.music.play(loops=-1)  # previa em loop
+        elif state == STATE_PLAY:
             if not playing:
                 if self._music_paused:
                     pygame.mixer.music.unpause()  # retoma de onde parou
                     self._music_paused = False
+                elif self._audio_offset >= 0:
+                    # inicia do zero, pulando o trecho que a latencia atrasaria
+                    pygame.mixer.music.play(start=self._audio_offset)
                 else:
-                    pygame.mixer.music.play()  # inicia do zero
+                    now = time.perf_counter()
+                    if self._music_start_at is None:
+                        self._music_start_at = now - self._audio_offset
+                    if now >= self._music_start_at:
+                        pygame.mixer.music.play()
+                        self._music_start_at = None
         elif state == STATE_PAUSE:
             if playing:
                 pygame.mixer.music.pause()
@@ -659,6 +957,7 @@ class Renderer:
             if playing:
                 pygame.mixer.music.stop()
             self._music_paused = False
+            self._music_start_at = None
 
     # ── Pre-renderizacao ──────────────────────────────────────────────────────
 
@@ -867,11 +1166,10 @@ class Renderer:
             self.fpga_misses = pkt["misses"]
             self.fpga_combo = pkt["combo"]
             self.fpga_frame_counter = pkt["frame_counter"]
-            new_song_id = pkt.get("song_id", 0)
-            if new_song_id != self.fpga_song_id:
-                self.fpga_song_id = new_song_id
-                self._selected_song = new_song_id
-                self._init_music()
+            # _update_music recarrega o audio se musica ou eq mudarem
+            self.fpga_song_id = pkt["song_id"]
+            self._selected_song = pkt["song_id"]
+            self._eq = pkt["eq"]
             self._detect_note_events()
 
     def _detect_note_events(self):
@@ -898,21 +1196,49 @@ class Renderer:
             pygame.K_j: 2,
             pygame.K_k: 3,
             pygame.K_SPACE: 4,
-            pygame.K_ESCAPE: 0,  # ESC em pausa = voltar ao menu (mesmo que btn[0])
         }
         for ev in events:
             if ev.type == pygame.KEYDOWN and ev.key in key_map:
                 btn[key_map[ev.key]] = True
+            # ESC em pausa = voltar ao menu (mesmo que btn[0]). So na pausa:
+            # na tela inicial, btn[0] abriria as configuracoes.
+            elif (
+                ev.type == pygame.KEYDOWN
+                and ev.key == pygame.K_ESCAPE
+                and self.fpga_state == STATE_PAUSE
+            ):
+                btn[0] = True
+
+        # Relogio de parede: a simulacao da 1 passo a cada 1/60 s reais, como o
+        # frame_tick da FPGA. Nao da para contar frames renderizados: o
+        # clock.tick(60) roda a ~59 fps e as notas atrasariam em relacao ao audio
+        # (~1 s ao fim de uma musica de 64 s).
+        now = time.perf_counter()
+        if self._sim_t0 is None:
+            self._sim_t0 = now
+        due = int((now - self._sim_t0) * FPS) - self._sim_steps
+        if due > _SIM_MAX_CATCHUP:
+            # Ficou parado demais (maquina suspensa): reancora
+            self._sim_t0 = now - (self._sim_steps + 1) / FPS
+            due = 1
+        # Teclas apertadas num frame sem passo ficam para o proximo passo
+        self._sim_btn = [a or b for a, b in zip(self._sim_btn, btn)]
+        if due <= 0:
+            return
 
         self._prev_notes = [list(t) for t in self.fpga_notes]
         self._prev_score = self.fpga_score
         self._prev_combo = self.fpga_combo
 
-        pkt = self.sim.step(btn)
-        # Sincronizar musica selecionada e recarregar audio se necessario
-        if self.sim._selected_song != self._selected_song:
-            self._selected_song = self.sim._selected_song
-            self._init_music()
+        # As teclas valem no ultimo passo, que corresponde ao instante atual
+        for _ in range(due - 1):
+            self.sim.step([False] * 5)
+        pkt = self.sim.step(self._sim_btn)
+        self._sim_btn = [False] * 5
+        self._sim_steps += due
+        # _update_music recarrega o audio se musica ou eq mudarem
+        self._selected_song = pkt["song_id"]
+        self._eq = pkt["eq"]
         self.fpga_state = pkt["state"]
         self.fpga_countdown = pkt["countdown"]
         self.fpga_notes = pkt["notes"]
@@ -1162,8 +1488,14 @@ class Renderer:
             sub = self.font(50).render("Aperte START para jogar", True, (255, 130, 0))
             self.screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, _py(360))))
 
+        # Fixo (sem piscar): entrada das configuracoes de som
+        cfg = self.font(36).render(
+            "Aperte D / F / J / K para configurar o som", True, (140, 170, 220)
+        )
+        self.screen.blit(cfg, cfg.get_rect(center=(SCREEN_W // 2, _py(400))))
+
         if self._sim_mode:
-            hint_text = "[SIM]  D / F / J / K = trilhas   |   SPACE = START"
+            hint_text = "[SIM]  SPACE = START   |   D / F / J / K = configuracoes"
         else:
             hint_text = ""
         hint = self.font(30).render(hint_text, True, (60, 95, 155))
@@ -1280,6 +1612,89 @@ class Renderer:
         self.screen.blit(
             hint, hint.get_rect(center=(SCREEN_W // 2, BOX_TOP + BOX_H + 28))
         )
+
+    def _draw_settings(self):
+        """
+        Tela de configuracoes: uma coluna por faixa do atenuador, alinhada com a
+        trilha do botao que a controla. Estatica de proposito (sem piscar nem
+        pulsar): o publico-alvo inclui jogadores sensiveis a estimulos.
+        """
+        self.screen.fill(BG_COLOR)
+        self._draw_bg_grid()
+        self._draw_tracks(alpha=18)
+        self.screen.blit(self.scanline_surf, (0, 0))
+
+        logo_rect = self._logo_title.get_rect(center=(SCREEN_W // 2, _py(55)))
+        self.screen.blit(self._logo_title, logo_rect)
+        title = self.font(52).render("CONFIGURAR SOM", True, (180, 220, 255))
+        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, _py(120))))
+
+        # Mesma grade de caixas da selecao de musica
+        BOX_W, BOX_H = _px(118), _py(270)
+        BOX_TOP = _py(155)
+        gap = _px(25)
+        total_w = 4 * BOX_W + 3 * gap
+        x_start = (SCREEN_W - total_w) // 2
+
+        SEG_W, SEG_H, SEG_GAP = _px(60), _py(22), _py(6)
+        for i, band in enumerate(EQ_BANDS):
+            cx = x_start + BOX_W // 2 + i * (BOX_W + gap)
+            color = TRACK_COLORS[i]
+            level = self._eq[i]
+            box_rect = pygame.Rect(cx - BOX_W // 2, BOX_TOP, BOX_W, BOX_H)
+
+            bg = pygame.Surface((BOX_W, BOX_H), pygame.SRCALPHA)
+            bg.fill((*color, 40))
+            self.screen.blit(bg, box_rect.topleft)
+            pygame.draw.rect(self.screen, color, box_rect, 2, border_radius=5)
+
+            key_s = self.font(40).render(TRACK_LABELS[i], True, color)
+            self.screen.blit(key_s, key_s.get_rect(center=(cx, BOX_TOP + _py(26))))
+            pygame.draw.line(
+                self.screen,
+                color,
+                (cx - BOX_W // 2 + _px(10), BOX_TOP + _py(46)),
+                (cx + BOX_W // 2 - _px(10), BOX_TOP + _py(46)),
+                1,
+            )
+
+            name_s = self.font(26).render(band["name"], True, (235, 240, 255))
+            self.screen.blit(name_s, name_s.get_rect(center=(cx, BOX_TOP + _py(64))))
+            range_s = self.font(16).render(band["range"], True, (130, 175, 225))
+            self.screen.blit(range_s, range_s.get_rect(center=(cx, BOX_TOP + _py(84))))
+
+            # Medidor: segmentos acesos = quanto da faixa ainda soa
+            # (4 = sem atenuacao, 1 = -18 dB)
+            lit = EQ_LEVELS - level
+            seg_bottom = BOX_TOP + _py(220)
+            for k in range(EQ_LEVELS):
+                y = seg_bottom - (k + 1) * SEG_H - k * SEG_GAP
+                seg = pygame.Rect(cx - SEG_W // 2, y, SEG_W, SEG_H)
+                if k < lit:
+                    pygame.draw.rect(self.screen, color, seg, border_radius=3)
+                else:
+                    pygame.draw.rect(self.screen, (50, 60, 90), seg, 1, border_radius=3)
+
+            db_text = "0 dB" if level == 0 else f"-{EQ_STEP_DB * level} dB"
+            db_s = self.font(30).render(db_text, True, (235, 240, 255))
+            self.screen.blit(db_s, db_s.get_rect(center=(cx, BOX_TOP + _py(246))))
+
+        info_y = BOX_TOP + BOX_H + _py(24)
+        steps = " > ".join(
+            "0 dB" if k == 0 else f"-{EQ_STEP_DB * k}" for k in range(EQ_LEVELS)
+        )
+        info = self.font(30).render(
+            f"Cada botao muda uma faixa:  {steps}  > 0 dB", True, (160, 190, 235)
+        )
+        self.screen.blit(info, info.get_rect(center=(SCREEN_W // 2, info_y)))
+        back = self.font(30).render("START = salvar e voltar", True, (255, 130, 0))
+        self.screen.blit(back, back.get_rect(center=(SCREEN_W // 2, info_y + _py(26))))
+
+        if self._sim_mode:
+            hint = self.font(26).render(
+                "[SIM]  D / F / J / K = faixas   |   SPACE = voltar", True, (55, 90, 150)
+            )
+            self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, info_y + _py(52))))
 
     def _draw_countdown(self, sec):
         self.screen.fill(BG_COLOR)
@@ -1459,6 +1874,8 @@ class Renderer:
                 self._draw_idle()
             elif s == STATE_SONG_SELECT:
                 self._draw_song_select()
+            elif s == STATE_SETTINGS:
+                self._draw_settings()
             elif s == STATE_COUNTDOWN:
                 self._draw_countdown(self.fpga_countdown)
             elif s == STATE_PLAY:
@@ -1479,8 +1896,24 @@ class Renderer:
                 )
 
             self.screen.blit(self.vignette_surf, (0, 0))
-            pygame.display.flip()
+            self._present()
             self.clock.tick(FPS)
+
+    def _present(self):
+        """Escala o frame 1800x1080 para a janela, mantendo a proporcao (letterbox)."""
+        self.window = pygame.display.get_surface()
+        win_w, win_h = self.window.get_size()
+        k = min(win_w / SCREEN_W, win_h / SCREEN_H)
+        w, h = max(1, int(SCREEN_W * k)), max(1, int(SCREEN_H * k))
+        if (w, h) == (SCREEN_W, SCREEN_H):
+            self.window.blit(self.screen, (0, 0))
+        else:
+            self.window.fill((0, 0, 0))
+            self.window.blit(
+                pygame.transform.smoothscale(self.screen, (w, h)),
+                ((win_w - w) // 2, (win_h - h) // 2),
+            )
+        pygame.display.flip()
 
 
 # ─── Entrada ──────────────────────────────────────────────────────────────────
@@ -1500,6 +1933,26 @@ if __name__ == "__main__":
         action="store_true",
         help="Modo simulacao: teclado (D/F/J/K=trilhas, SPACE=START), sem FPGA",
     )
+    parser.add_argument(
+        "--audio-offset",
+        type=int,
+        default=0,
+        metavar="MS",
+        help="Compensa latencia extra do audio em ms (ex.: 200 para fone Bluetooth; "
+        "negativo se as notas chegam depois do som)",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=None,
+        help="Escala da janela sobre 1800x1080, ex.: 0.6 (padrao: cabe em 90%% da tela)",
+    )
     args = parser.parse_args()
 
-    Renderer(serial_port=args.port, baudrate=args.baud, sim_mode=args.sim).run()
+    Renderer(
+        serial_port=args.port,
+        baudrate=args.baud,
+        sim_mode=args.sim,
+        scale=args.scale,
+        audio_offset_ms=args.audio_offset,
+    ).run()

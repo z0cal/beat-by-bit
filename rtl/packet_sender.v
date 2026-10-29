@@ -7,8 +7,13 @@
  *
  * Formato do pacote (22 bytes):
  *   [0]    0x55          marcador de inicio
- *   [1]    game_state    0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
- *   [2]    countdown_sec 3,2,1,0
+ *   [1]    {eq[3:0], game_state}
+ *            game_state  0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
+ *                        6=SELECT 7=SETTINGS
+ *            eq[1:0]=GRAVES (bits 5:4), eq[3:2]=MEDIOS (bits 7:6)
+ *   [2]    {eq[7:4], countdown_sec[3:0]}
+ *            countdown   3,2,1,0
+ *            eq[5:4]=AGUDOS (bits 5:4), eq[7:6]=BRILHO (bits 7:6)
  *   [3]    trilha0_nota0 age (0xFF = vazio)
  *   [4]    trilha0_nota1 age
  *   [5]    trilha0_nota2 age
@@ -19,13 +24,15 @@
  *  [16]    score[7:0]
  *  [17]    misses
  *  [18]    combo
- *  [19]    {2'b00, frame_counter[13:8]}  (6 bits altos)
+ *  [19]    {song_id, frame_counter[13:8]}  (6 bits altos)
  *  [20]    frame_counter[7:0]            (8 bits baixos)
  *  [21]    0xAA          marcador de fim
  *-----------------------------------------------------------------------
  */
 
-module packet_sender (
+module packet_sender #(
+    parameter CLKS_PER_BIT = 434     // 50 MHz / 115200 baud; o TB encurta
+) (
     input  wire        clock,
     input  wire        reset,
     input  wire        frame_tick,      // pulso de 1 ciclo a 60fps
@@ -51,6 +58,9 @@ module packet_sender (
     // ID da musica selecionada (bits 7:6 do byte 19)
     input  wire [1:0]  song_id,
 
+    // Niveis do atenuador de frequencias (nibbles altos dos bytes 1 e 2)
+    input  wire [7:0]  eq,
+
     // Saida serial
     output wire        uart_tx_out
 );
@@ -60,7 +70,7 @@ module packet_sender (
     reg        tx_valid;
     wire       tx_ready;
 
-    uart_tx #(.CLKS_PER_BIT(434)) u_tx (
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
         .clock     (clock),
         .reset     (reset),
         .tx_data   (tx_data),
@@ -95,8 +105,8 @@ module packet_sender (
                     if (frame_tick) begin
                         // Captura estado atual no buffer do pacote
                         pkt[0]  <= 8'h55;
-                        pkt[1]  <= {4'b0000, game_state};
-                        pkt[2]  <= countdown_sec;
+                        pkt[1]  <= {eq[3:0], game_state};
+                        pkt[2]  <= {eq[7:4], countdown_sec[3:0]};
                         pkt[3]  <= t0n0; pkt[4]  <= t0n1; pkt[5]  <= t0n2;
                         pkt[6]  <= t1n0; pkt[7]  <= t1n1; pkt[8]  <= t1n2;
                         pkt[9]  <= t2n0; pkt[10] <= t2n1; pkt[11] <= t2n2;

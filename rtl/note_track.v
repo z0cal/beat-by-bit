@@ -41,7 +41,11 @@ module note_track (
     // Pulsos de 1 ciclo
     output reg hit_pulse,     // acerto: botao na janela de uma nota
     output reg escape_pulse,  // erro: nota passou sem ser apertada
-    output reg bad_press      // erro: botao apertado sem nota na janela
+    output reg bad_press,     // erro: botao apertado sem nota na janela
+
+    // Age da nota acertada, valido junto com hit_pulse (119..141).
+    // Usado pelo bloco de metricas: assincronia e = hit_age - 130.
+    output reg [7:0] hit_age
 );
 
     localparam EMPTY      = 8'hFF;
@@ -84,6 +88,7 @@ module note_track (
             hit_pulse    <= 0;
             escape_pulse <= 0;
             bad_press    <= 0;
+            hit_age      <= 0;
         end else begin
             // Limpa pulsos a cada ciclo
             hit_pulse    <= 0;
@@ -129,12 +134,15 @@ module note_track (
                 if (valid[0] && in_hit_window(ages[0])) begin
                     valid[0]  <= 0;
                     hit_pulse <= 1;
+                    hit_age   <= ages[0];
                 end else if (valid[1] && in_hit_window(ages[1])) begin
                     valid[1]  <= 0;
                     hit_pulse <= 1;
+                    hit_age   <= ages[1];
                 end else if (valid[2] && in_hit_window(ages[2])) begin
                     valid[2]  <= 0;
                     hit_pulse <= 1;
+                    hit_age   <= ages[2];
                 end else begin
                     // Botao pressionado sem nota na janela
                     bad_press <= 1;

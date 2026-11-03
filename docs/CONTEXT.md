@@ -10,15 +10,39 @@ Layout: `rtl/` (Verilog + Quartus + charts `.hex`), `tb/` (testbenches), `pc/` (
 
 ```
 FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
-  projeto.v           (22 bytes/frame)    interface.py
+  projeto.v           (46 bytes/frame)    interface.py
   unidade_controle.v                      SimulationEngine (--sim)
   fluxo_dados.v
   packet_sender.v
 ```
 
-- **FPGA**: lógica do jogo (FSM, notas, score). Envia pacotes UART de 22 bytes a 60fps.
+- **FPGA**: lógica do jogo (FSM, notas, score) e métricas da sessão. Envia pacotes UART de 46
+  bytes a 60fps.
 - **Python**: renderiza o que recebe via UART. Em `--sim`, roda a FSM localmente sem FPGA.
 - **Teclas (sim)**: D/F/J/K = trilhas 0-3 | SPACE = START/PAUSE | ESC = voltar (pausa)
+- **Configurações de som (estado SETTINGS = 7)**: na tela inicial, qualquer botão de trilha
+  abre o atenuador de frequências; START volta. Lá, cada botão avança o nível da sua faixa
+  (0 → −6 → −12 → −18 dB → 0): D = graves (< 250 Hz), F = médios (250 Hz–2 kHz),
+  J = agudos (2–6 kHz), K = brilho (> 6 kHz). A FPGA guarda os níveis (`eq_config.v`, zeram
+  só no reset) e os envia no pacote; o PC filtra o WAV por FFT (`_eq_wav_bytes`) e toca uma
+  prévia de 10 s em loop enquanto o jogador ajusta.
+- **Dashboard de fim de sessão (DASHBOARD_SESSAO)**: ao fim da música (WIN/LOSE) o PC mostra
+  taxa de acerto, assincronia média e desvio-padrão (ms), maior combo, acertos por trilha e por
+  mão (D+F, J+K) e a variação em relação à sessão anterior do mesmo pseudônimo. Gesto e
+  metrônomo aparecem como "ainda não disponível". A tela é estática (sem piscar).
+  - **Métricas na FPGA** (`metricas.v`, dentro do `fluxo_dados`): a cada acerto,
+    `e = age − 130` quadros (negativo = adiantado); acumula N, Σe, Σ|e|, Σe², notas julgadas e
+    acertos por trilha (12 bits) e o maior combo. Zera em COUNTDOWN; congela em PAUSE/END/IDLE.
+    O PC calcula média = Σe/N e desvio = √(Σe²/N − média²), × 16,7 ms.
+  - **Taxa nos displays (TAXA_HEX)**: no END, HEX2–HEX0 mostram ⌊100·N/notas⌋ (divisor
+    sequencial `taxa_acerto.v`), sem zeros à esquerda; fora do END, HEX0 = estado,
+    HEX1 = jogada, HEX2 apagado. Porta nova `db_hex2` no top (pinos Y19…AB21, mesma ordem
+    de bits do HEX0/HEX1: `[0]` = segmento `a`).
+  - **Histórico local**: `--pseudonimo NOME` (só letras, dígitos, `_`, `-`; nunca o nome da
+    criança). Cada música terminada vira uma linha em `sessoes/sessoes.csv` (`--historico` muda
+    o caminho; a pasta está no `.gitignore`). Falha de disco só gera aviso. É a base do MQTT
+    da Semana 4 (mesmos campos, `session_row`). Se a interface abrir com a música já no fim,
+    a sessão não é gravada.
 
 ---
 
@@ -36,11 +60,36 @@ Arquivos MIDI: `songs/condado/condado_curta.mid`, `songs/ocarina/Ocarina_curta.m
 
 Charts `.hex` gerados automaticamente em `rtl/` no startup do SimulationEngine: `condado_curta.hex`, `ocarina_curta.hex`, `power_rangers.hex`. Esses arquivos são necessários para o Quartus (`$readmemh`).
 
-**Algoritmo de geração de chart** (`_midi_to_chart`):
-- Mapeamento de pitch → lane por **quartis** do MIDI atual (não thresholds fixos) — distribui ~25% das notas em cada lane
-- Agrupamento por frame + escolha do lane **menos recentemente usado** ao resolver colisões simultâneas — garante que todos os 4 lanes recebam notas
-- Usa apenas `_MIN_NOTE_SPACING` (espaçamento por trilha) e `_MAX_SIMULTANEOUS`; `_GLOBAL_SPACING` não é mais aplicado no gerador de chart
-- `_DIFF_PRESETS["facil"] = (50, 18, 1)` — min_lane=50 (≈0.83s entre notas na mesma lane), max_sim=1
+**Algoritmo de geração de chart** (`_midi_to_chart`, regerar com `uv run python pc/gerar_hex.py`):
+- **Foco na melodia:** cada música declara em `SONGS` os canais MIDI da melodia (`"melody"`).
+  Em acordes, fica só a nota mais aguda (skyline). Quando a melodia some por mais de 2,5 s, a
+  voz mais aguda do acompanhamento preenche a lacuna. A bateria (canal 9) nunca entra.
+- **Trilha pela altura:** quartis das alturas que levam empates em conta (a melodia "sobe" para a
+  direita). Se a trilha preferida estiver ocupada, a nota vai para a vizinha livre mais próxima.
+- **Quantidade:** `CHART_NOTE_FACTOR` (0,65) × `ref_notes` (notas do chart antigo). As notas
+  entram por prioridade: cabeça de compasso > tempo > colcheia; melodia antes de preenchimento;
+  notas longas antes das curtas.
+- **Restrições:** espaçamento global e por trilha do preset de dificuldade, e 3 slots por trilha
+  (quaisquer 4 notas seguidas na mesma trilha ocupam ≥ 152 frames).
+- Quando a melodia não tem notas jogáveis suficientes no espaçamento do preset, o chart fica abaixo
+  do alvo (Hobbits e Pokémon no "fácil").
+- `_DIFF_PRESETS["facil"] = (60, 30, 1)`: 60 frames (1 s) entre notas da mesma trilha e 30
+  (0,5 s) entre quaisquer notas; max_sim não se aplica (a melodia é monofônica).
+- **Toda nota é julgada antes do fim:** só entram notas com `frame + 153 < total_frames`, para
+  acertar ou escapar antes do END (senão ficariam fora das métricas). Contagens atuais:
+  74 / 57 / 86 / 67.
+- `HIT_AGE = 130` (centro da janela, igual ao `HIT_CENTER` do `note_track.v`). Antes era
+  `HIT_Y // NOTE_SPEED` = 129.0 por erro de ponto flutuante, o que deslocava os charts 1 quadro
+  e enviesaria a assincronia em −17 ms.
+
+**Sincronia chart × áudio:**
+- Os WAVs são renderizações dos MIDIs: alinhados, sem deriva (medido por correlação de onsets).
+- No `--sim`, a simulação avança pelo relógio de parede (`time.perf_counter`), 1 passo a cada
+  1/60 s, como o `frame_tick` da FPGA. Não conta frames renderizados: `clock.tick(60)` roda a
+  ~59 fps e as notas atrasavam ~1 s ao fim da música.
+- `--audio-offset MS` compensa latência extra da saída de áudio (ex.: 200 para fone Bluetooth;
+  negativo se as notas chegam depois do som). O buffer do mixer já é compensado no chart por
+  `AUDIO_LATENCY_FRAMES`.
 
 ---
 
@@ -51,7 +100,7 @@ linhas 28-35   : _AUDIO_BUFFER=16384 + pygame.mixer.pre_init(44100,-16,2,_AUDIO_
                  pre_init ANTES de pygame.init() — evita double-init
 linhas 52-55   : FPS=60, AUDIO_LATENCY_FRAMES=round(_AUDIO_BUFFER/44100*FPS) ≈ 22
                  Compensa latencia do buffer: notas spawnam AUDIO_LATENCY_FRAMES mais tarde
-linhas 56-74   : HIT_AGE = HIT_Y // NOTE_SPEED  ← float! usar int(HIT_AGE) em índices
+linhas 56-74   : HIT_AGE = round(HIT_Y / NOTE_SPEED) = 130 (int)
 linhas 100-140 : SONG_DURATION_MS, ROM_DEPTH, SONGS[], PACKET_SIZE
 linhas 265-350 : _midi_to_chart(song_config=None, save_hex=False)
 linhas 328-490 : class SimulationEngine
@@ -86,17 +135,25 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 
 ## Protocolo UART (FPGA → Python)
 
-Pacote de 22 bytes a 60fps:
+Pacote de 46 bytes a 60fps (~4 ms de transmissão por quadro de 16,7 ms):
 ```
 [0]  = 0x55 (header)
-[1]  = state (4 bits baixos): 0=idle,1=countdown,2=play,3=pause,4=win,5=lose,6=select
-[2]  = countdown_sec (3,2,1,0)
+[1]  = {eq[3:0], state}: state nos 4 bits baixos (0=idle,1=countdown,2=play,3=pause,
+       4=win,5=lose,6=select,7=settings); bits 5:4 = graves, 7:6 = médios
+[2]  = {eq[7:4], countdown_sec[3:0]}: countdown 3,2,1,0; bits 5:4 = agudos, 7:6 = brilho
 [3..14] = ages das notas: 4 trilhas × 3 slots × 1 byte (0xFF = slot vazio)
 [15..16] = score (16 bits big-endian)
 [17] = misses
 [18] = combo
-[19..20] = frame_counter (14 bits: [19]bits13-8, [20]bits7-0)
-[21] = 0xAA (footer)
+[19..20] = song_id ([19] bits 7-6) + frame_counter (14 bits: [19]bits13-8, [20]bits7-0)
+--- métricas da sessão (metricas.v) ---
+[21] = maior combo
+[22..23] = N, acertos em botão (16 bits)
+[24..26] = Σe (24 bits, complemento de 2)
+[27..29] = Σ|e| (24 bits)
+[30..32] = Σe² (24 bits)
+[33..44] = por trilha t, 3 bytes a partir de 33+3t: {notas[t] 12 bits, acertos[t] 12 bits}
+[45] = 0xAA (footer)
 ```
 
 ---
@@ -104,7 +161,9 @@ Pacote de 22 bytes a 60fps:
 ## Como rodar
 
 ```bash
-python pc/interface.py --sim          # modo simulação (sem FPGA)
+uv run pc/interface.py --sim          # modo simulação (sem FPGA)
+uv run pc/interface.py --sim --pseudonimo ana01   # grava o histórico e compara sessões
+uv run --extra fpga pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
 python pc/interface.py --port COM3    # modo FPGA (Windows)
 python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 ```
@@ -113,7 +172,7 @@ python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 
 ## Dependências Python
 
-`pygame`, `mido`, `pyserial` (opcional, apenas modo FPGA)
+`pygame`, `mido`, `numpy` (atenuador), `pyserial` (opcional, apenas modo FPGA)
 
 ---
 
@@ -132,14 +191,24 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | Arquivo | Papel |
 |---------|-------|
 | `projeto.v` | Top-level, instancia UC + FD + packet_sender |
-| `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose) |
+| `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose; idle↔settings) |
+| `eq_config.v` | Níveis do atenuador de frequências (2 bits por faixa) |
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
-| `packet_sender.v` | Serializa estado em pacote UART |
-| `note_track.v` | 1 trilha com 3 slots de nota |
+| `packet_sender.v` | Serializa estado em pacote UART (46 bytes) |
+| `note_track.v` | 1 trilha com 3 slots de nota; `hit_age` = idade da nota acertada |
+| `metricas.v` | Acumuladores da sessão: N, Σe, Σ\|e\|, Σe², notas/acertos por trilha, maior combo |
+| `taxa_acerto.v` | Divisor sequencial: taxa de acerto em % e dígitos para o HEX |
 | `debounce_pulse.v` | Debounce + detecção de borda |
 | `contador_m.v` | Contador parametrizável |
 
-Testbenches (`tb/`): `tb_fd.v`, `tb_uc_ganha.v`, `tb_uc_perde.v`, `tb_countdown_transition.v`, etc.
+Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note_track` reais),
+`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (46 bytes),
+`tb_note_track.v`, `tb_fd.v`, `tb_uc_*.v`, etc. `tb_countdown_transition.v` falha desde antes
+(segura o reset ativo e referencia um `u_game_timer` que não existe).
+
+Rodar sem o script `check`: `iverilog -g2012 -o .sim/X.out -s X rtl/*.v tb/X.v && vvp -n .sim/X.out`.
+O `make yosys` não funciona no macOS (o `sed` do BSD não aceita `\|`); rodar o yosys à mão
+com a lista de fontes do `.qsf`.
 
 ---
 
@@ -154,7 +223,7 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
 |-------|----------|-----------|---------|
 | `uart_tx_out` | 1 | N16 | RXD do CP2102 (GND do CP2102 no pino 12) |
 | `uart_rx_in` | 2 | B16 | TXD do CP2102 (ACK do PC) |
-| `reset` | 16 | T22 | botão → GND + pull-up 10 kΩ (apertado = reset) |
+| `reset` | 16 | T22 | opcional: botão → GND (pull-up interno ligado; apertado = reset) |
 | `botoes[4]` START/PAUSE | 36 | T20 | botão → GND + pull-up 10 kΩ |
 | `botoes[1]` | 37 | T19 | idem |
 | `botoes[3]` | 38 | T18 | idem |
@@ -162,8 +231,10 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
 | `botoes[2]` | 40 | T15 | idem |
 | 3,3 V / GND | 29 / 30 | — | trilhos + / − dos pull-ups e botões |
 
-- Pull-ups são **externos** (o `.qsf` não liga o pull-up interno): solto = 1, apertado = 0.
-- `clock` = CLOCK_50 (M9). `HEX0` = estado da FSM, `HEX1` = `botoes[3:0]` registrados na jogada.
+- Pull-ups dos botões são **externos**: solto = 1, apertado = 0. O `reset` usa o pull-up interno
+  (`WEAK_PULL_UP_RESISTOR` no `.qsf`): pode ficar sem nada ligado no pino 16.
+- `clock` = CLOCK_50 (M9). Fora do END: `HEX0` = estado da FSM, `HEX1` = `botoes[3:0]` registrados na
+  jogada, `HEX2` apagado. No END: `HEX2..0` = taxa de acerto em %.
 - LEDR0..4 = `leds_pulsos` = {start, fim_contagem, fim_tempo, link_ok, jogada_feita} na ordem
   LEDR0 = start ... LEDR4 = jogada_feita. LEDR5..9 = `botoes[0..4]` crus (aceso = solto).
 - **LEDR3 = link serial ok** (`uart_link.v`): o Python manda `0xA5` a cada 0,25 s enquanto recebe
@@ -174,8 +245,8 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
 ### Pegadinhas conhecidas (verificado em 27/10/2026)
 
 - **Segmentos dos displays** (corrigido em 27/10/2026): o `.qsf` tinha `db_estado`/`db_jogada`
-  com índices `[6:0]` invertidos. Agora `[0]` = segmento `a` (U21 em HEX0, AA20 em HEX1), que é a
-  ordem do `hexa7seg` (`0 = 7'b1000000`, bit 6 = `g`).
+  com índices `[6:0]` invertidos. Agora `[0]` = segmento `a` (U21 em HEX0, AA20 em HEX1, Y19 em HEX2),
+  que é a ordem do `hexa7seg` (`0 = 7'b1000000`, bit 6 = `g`).
 - **Jogada conta ao soltar**: `debounce_pulse` dispara na subida do sinal; com pull-up, a subida
   é quando o botão é solto. Lockout de 9 M ciclos (180 ms).
 - **LEDR0, 2, 4 nunca acendem visivelmente** (pulsos de 1 ciclo). `perdeu = 1'b0` (sem limite
@@ -183,11 +254,8 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
   PLAY/PAUSE (o contador do countdown para em 179).
 - Na **PAUSE**, qualquer botão 0..3 (`song_ok`) volta para IDLE, não só o botão 0.
 - **`tb_countdown_transition` falha** desde antes de 27/10/2026 (estado fica em 0); as demais passam.
-- `SerialReader` (Python) guarda `self._stop` como `Event`, o que sobrescreve `Thread._stop`:
-  `join()` quebra com TypeError. O jogo não chama `join`, então não aparece em uso.
-
-- **Serial muda (0 bytes) com a FPGA gravada = olhar primeiro o pino `reset`** (verificado em 03/11/2026).
-  `reset_i = ~reset` e o `.qsf` não liga pull-up interno: com o pino 16 do JP1 (T22) solto, ele oscila,
+- **Serial muda (0 bytes) com a FPGA gravada = olhar primeiro o pino `reset`** (verificado em 03/11/2026,
+  corrigido com o pull-up interno). `reset_i = ~reset`: sem o pull-up, com o pino 16 do JP1 (T22) solto, ele oscila,
   zera o `u_frame_counter` e o `frame_tick` nunca sai, logo nenhum pacote é enviado. O caminho pino 1 → RXD
   estava bom. Medido: sem pull-up, `reset`=0 em 125 de 143 leituras; com `WEAK_PULL_UP_RESISTOR` em
   `reset`, 192 de 192 em 1 e 60 pacotes/s. Sintoma na placa: HEX0 preso em 0 e LEDR3 apagado.

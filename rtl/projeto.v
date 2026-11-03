@@ -4,6 +4,12 @@
  *-----------------------------------------------------------------------
  * Descricao : Modulo top-level. Instancia UC, FD, packet_sender e
  *             displays de debug. Adiciona saida UART para PC.
+ *
+ * Displays HEX:
+ *   Fora do fim de musica: HEX0 = estado da FSM, HEX1 = ultima jogada,
+ *   HEX2 apagado.
+ *   No fim de musica (END_WIN/END_LOSE): HEX2-HEX0 = taxa de acerto em
+ *   porcentagem (TAXA_HEX), sem zeros a esquerda. Ex.: 100, 87, 5.
  *-----------------------------------------------------------------------
  */
 
@@ -13,6 +19,7 @@ module beat_by_bit (
     input  wire [4:0]  botoes,
     output wire [6:0]  db_estado,    // HEX0: Estado da FSM
     output wire [6:0]  db_jogada,    // HEX1: Ultimo botao pressionado
+    output wire [6:0]  db_hex2,      // HEX2: centena da taxa de acerto (no END)
     output wire [4:0]  leds_pulsos,  // LEDs de debug
     output wire [4:0]  db_botoes_raw,// Debug: botoes crus (LEDR 5-9)
     output wire        uart_tx_out,  // TX serial para o PC (115200 baud)
@@ -42,6 +49,15 @@ module beat_by_bit (
     wire [13:0] s_frame_counter;
     wire [1:0]  s_song_id;
     wire        s_link_ok;
+    wire [7:0]  s_eq;
+
+    // Metricas da sessao (FD -> packet_sender e taxa de acerto)
+    wire [15:0] s_met_n;
+    wire [20:0] s_met_soma_e;
+    wire [19:0] s_met_soma_abs;
+    wire [22:0] s_met_soma_e2;
+    wire [47:0] s_met_notas, s_met_acertos;
+    wire [7:0]  s_met_max_combo;
 
     // LEDR3 = link serial ok (PC recebendo pacotes); perdeu e fixo em 0
     assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_link_ok, s_jogada_feita};
@@ -99,7 +115,15 @@ module beat_by_bit (
         .combo         (s_combo),
         .frame_tick_out    (s_frame_tick),
         .frame_counter_out (s_frame_counter),
-        .song_id_out       (s_song_id)
+        .song_id_out       (s_song_id),
+        .eq_out            (s_eq),
+        .met_n             (s_met_n),
+        .met_soma_e        (s_met_soma_e),
+        .met_soma_abs      (s_met_soma_abs),
+        .met_soma_e2       (s_met_soma_e2),
+        .met_notas         (s_met_notas),
+        .met_acertos       (s_met_acertos),
+        .met_max_combo     (s_met_max_combo)
     );
 
     // ----------------------------------------------------------------
@@ -120,6 +144,14 @@ module beat_by_bit (
         .combo         (s_combo),
         .frame_counter (s_frame_counter),
         .song_id       (s_song_id),
+        .eq            (s_eq),
+        .met_max_combo (s_met_max_combo),
+        .met_n         (s_met_n),
+        .met_soma_e    (s_met_soma_e),
+        .met_soma_abs  (s_met_soma_abs),
+        .met_soma_e2   (s_met_soma_e2),
+        .met_notas     (s_met_notas),
+        .met_acertos   (s_met_acertos),
         .uart_tx_out   (uart_tx_out)
     );
 
@@ -134,16 +166,50 @@ module beat_by_bit (
     );
 
     // ----------------------------------------------------------------
+    // Taxa de acerto (divisor sequencial) para os displays
+    // ----------------------------------------------------------------
+    wire [13:0] s_notas_total = {2'b00, s_met_notas[11:0]}  + {2'b00, s_met_notas[23:12]}
+                              + {2'b00, s_met_notas[35:24]} + {2'b00, s_met_notas[47:36]};
+    wire [6:0]  s_taxa;
+    wire [3:0]  s_taxa_c, s_taxa_d, s_taxa_u;
+
+    taxa_acerto u_taxa (
+        .clock  (clock),
+        .reset  (reset_i),
+        .acertos(s_met_n),
+        .notas  (s_notas_total),
+        .taxa   (s_taxa),
+        .centena(s_taxa_c),
+        .dezena (s_taxa_d),
+        .unidade(s_taxa_u)
+    );
+
+    // ----------------------------------------------------------------
     // Displays de debug
     // ----------------------------------------------------------------
+    wire [6:0] seg_estado, seg_jogada, seg_c, seg_d, seg_u;
+
     hexa7seg u_hex_est (
         .hex(s_estado),
-        .seg(db_estado)
+        .seg(seg_estado)
     );
 
     hexa7seg u_hex_jog (
         .hex(s_valor_jogada),
-        .seg(db_jogada)
+        .seg(seg_jogada)
     );
+
+    hexa7seg u_hex_c (.hex(s_taxa_c), .seg(seg_c));
+    hexa7seg u_hex_d (.hex(s_taxa_d), .seg(seg_d));
+    hexa7seg u_hex_u (.hex(s_taxa_u), .seg(seg_u));
+
+    // Fim de musica: 0100 = END_WIN, 0101 = END_LOSE
+    wire       fim_musica = (s_estado == 4'b0100) || (s_estado == 4'b0101);
+    localparam [6:0] APAGADO = 7'b1111111;   // segmentos ativos em 0
+
+    assign db_estado = fim_musica ? seg_u : seg_estado;
+    assign db_jogada = fim_musica ? ((s_taxa_c != 4'd0 || s_taxa_d != 4'd0) ? seg_d : APAGADO)
+                                  : seg_jogada;
+    assign db_hex2   = (fim_musica && s_taxa_c != 4'd0) ? seg_c : APAGADO;
 
 endmodule

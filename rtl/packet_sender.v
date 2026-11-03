@@ -2,13 +2,19 @@
  * Arquivo   : packet_sender.v
  * Projeto   : Beat by Bit - Semestre 2
  *-----------------------------------------------------------------------
- * Descricao : Monta e envia um pacote de 22 bytes via UART a cada
+ * Descricao : Monta e envia um pacote de 46 bytes via UART a cada
  *             frame_tick. Aguarda o uart_tx ficar pronto entre bytes.
+ *             46 bytes a 115200 baud levam ~4 ms (o quadro tem 16,7 ms).
  *
- * Formato do pacote (22 bytes):
+ * Formato do pacote (46 bytes, valores multibyte em big-endian):
  *   [0]    0x55          marcador de inicio
- *   [1]    game_state    0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
- *   [2]    countdown_sec 3,2,1,0
+ *   [1]    {eq[3:0], game_state}
+ *            game_state  0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
+ *                        6=SELECT 7=SETTINGS
+ *            eq[1:0]=GRAVES (bits 5:4), eq[3:2]=MEDIOS (bits 7:6)
+ *   [2]    {eq[7:4], countdown_sec[3:0]}
+ *            countdown   3,2,1,0
+ *            eq[5:4]=AGUDOS (bits 5:4), eq[7:6]=BRILHO (bits 7:6)
  *   [3]    trilha0_nota0 age (0xFF = vazio)
  *   [4]    trilha0_nota1 age
  *   [5]    trilha0_nota2 age
@@ -19,13 +25,23 @@
  *  [16]    score[7:0]
  *  [17]    misses
  *  [18]    combo
- *  [19]    {2'b00, frame_counter[13:8]}  (6 bits altos)
+ *  [19]    {song_id, frame_counter[13:8]}  (6 bits altos)
  *  [20]    frame_counter[7:0]            (8 bits baixos)
- *  [21]    0xAA          marcador de fim
+ *  --- metricas da sessao (metricas.v) ---
+ *  [21]    maior combo
+ *  [22-23] N: acertos em botao (16 bits)
+ *  [24-26] soma de e = age - 130 (24 bits, complemento de 2)
+ *  [27-29] soma de |e|  (24 bits)
+ *  [30-32] soma de e^2  (24 bits)
+ *  [33-44] por trilha t (3 bytes cada, a partir de 33 + 3t):
+ *            {notas[t][11:0], acertos[t][11:0]}
+ *  [45]    0xAA          marcador de fim
  *-----------------------------------------------------------------------
  */
 
-module packet_sender (
+module packet_sender #(
+    parameter CLKS_PER_BIT = 434     // 50 MHz / 115200 baud; o TB encurta
+) (
     input  wire        clock,
     input  wire        reset,
     input  wire        frame_tick,      // pulso de 1 ciclo a 60fps
@@ -51,6 +67,18 @@ module packet_sender (
     // ID da musica selecionada (bits 7:6 do byte 19)
     input  wire [1:0]  song_id,
 
+    // Niveis do atenuador de frequencias (nibbles altos dos bytes 1 e 2)
+    input  wire [7:0]  eq,
+
+    // Metricas da sessao (ver metricas.v)
+    input  wire [7:0]  met_max_combo,
+    input  wire [15:0] met_n,
+    input  wire [20:0] met_soma_e,
+    input  wire [19:0] met_soma_abs,
+    input  wire [22:0] met_soma_e2,
+    input  wire [47:0] met_notas,      // 12 bits por trilha
+    input  wire [47:0] met_acertos,    // 12 bits por trilha
+
     // Saida serial
     output wire        uart_tx_out
 );
@@ -60,7 +88,7 @@ module packet_sender (
     reg        tx_valid;
     wire       tx_ready;
 
-    uart_tx #(.CLKS_PER_BIT(434)) u_tx (
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
         .clock     (clock),
         .reset     (reset),
         .tx_data   (tx_data),
@@ -69,17 +97,25 @@ module packet_sender (
         .tx_ready  (tx_ready)
     );
 
-    // Maquina de estados: espera frame_tick, depois envia 20 bytes
+    localparam integer PACKET_SIZE = 46;
+
+    // Maquina de estados: espera frame_tick, depois envia PACKET_SIZE bytes
     localparam WAIT   = 2'd0;  // aguardando proximo frame
     localparam LOAD   = 2'd1;  // carrega byte atual no tx
     localparam SEND   = 2'd2;  // aguarda uart_tx absorver o byte
     localparam DONE   = 2'd3;  // pacote completo, volta a WAIT
 
     reg [1:0]  state;
-    reg [4:0]  byte_idx;  // 0-21
+    reg [5:0]  byte_idx;  // 0 a PACKET_SIZE-1
 
     // Buffer do pacote (latchado no frame_tick para consistencia)
-    reg [7:0] pkt [0:21];
+    reg [7:0] pkt [0:PACKET_SIZE-1];
+
+    // Somas estendidas para 24 bits (soma_e com sinal)
+    wire [23:0] soma_e_24   = {{3{met_soma_e[20]}}, met_soma_e};
+    wire [23:0] soma_abs_24 = {4'd0, met_soma_abs};
+    wire [23:0] soma_e2_24  = {1'b0, met_soma_e2};
+    integer t;
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
@@ -95,8 +131,8 @@ module packet_sender (
                     if (frame_tick) begin
                         // Captura estado atual no buffer do pacote
                         pkt[0]  <= 8'h55;
-                        pkt[1]  <= {4'b0000, game_state};
-                        pkt[2]  <= countdown_sec;
+                        pkt[1]  <= {eq[3:0], game_state};
+                        pkt[2]  <= {eq[7:4], countdown_sec[3:0]};
                         pkt[3]  <= t0n0; pkt[4]  <= t0n1; pkt[5]  <= t0n2;
                         pkt[6]  <= t1n0; pkt[7]  <= t1n1; pkt[8]  <= t1n2;
                         pkt[9]  <= t2n0; pkt[10] <= t2n1; pkt[11] <= t2n2;
@@ -107,7 +143,25 @@ module packet_sender (
                         pkt[18] <= combo;
                         pkt[19] <= {song_id[1:0], frame_counter[13:8]};
                         pkt[20] <= frame_counter[7:0];
-                        pkt[21] <= 8'hAA;
+                        pkt[21] <= met_max_combo;
+                        pkt[22] <= met_n[15:8];
+                        pkt[23] <= met_n[7:0];
+                        pkt[24] <= soma_e_24[23:16];
+                        pkt[25] <= soma_e_24[15:8];
+                        pkt[26] <= soma_e_24[7:0];
+                        pkt[27] <= soma_abs_24[23:16];
+                        pkt[28] <= soma_abs_24[15:8];
+                        pkt[29] <= soma_abs_24[7:0];
+                        pkt[30] <= soma_e2_24[23:16];
+                        pkt[31] <= soma_e2_24[15:8];
+                        pkt[32] <= soma_e2_24[7:0];
+                        for (t = 0; t < 4; t = t + 1) begin
+                            pkt[33 + 3*t] <= met_notas[12*t + 4 +: 8];
+                            pkt[34 + 3*t] <= {met_notas[12*t +: 4],
+                                              met_acertos[12*t + 8 +: 4]};
+                            pkt[35 + 3*t] <= met_acertos[12*t +: 8];
+                        end
+                        pkt[45] <= 8'hAA;
                         byte_idx <= 0;
                         state    <= LOAD;
                     end
@@ -124,10 +178,10 @@ module packet_sender (
                 SEND: begin
                     // Aguarda uart_tx comecar a transmitir (tx_ready cai)
                     if (!tx_ready) begin
-                        if (byte_idx == 21) begin
+                        if (byte_idx == PACKET_SIZE - 1) begin
                             state <= DONE;
                         end else begin
-                            byte_idx <= byte_idx + 5'd1;
+                            byte_idx <= byte_idx + 6'd1;
                             state    <= LOAD;
                         end
                     end

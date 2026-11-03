@@ -64,3 +64,6 @@ build/
 .yosys/
 quartus/de0_cv/*.smsg
 abc.history
+
+# Historico de sessoes (dados de criancas, so pseudonimo): nunca versionar
+sessoes/

@@ -10,13 +10,14 @@ Layout: `rtl/` (Verilog + Quartus + charts `.hex`), `tb/` (testbenches), `pc/` (
 
 ```
 FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
-  projeto.v           (22 bytes/frame)    interface.py
+  projeto.v           (46 bytes/frame)    interface.py
   unidade_controle.v                      SimulationEngine (--sim)
   fluxo_dados.v
   packet_sender.v
 ```
 
-- **FPGA**: lógica do jogo (FSM, notas, score). Envia pacotes UART de 22 bytes a 60fps.
+- **FPGA**: lógica do jogo (FSM, notas, score) e métricas da sessão. Envia pacotes UART de 46
+  bytes a 60fps.
 - **Python**: renderiza o que recebe via UART. Em `--sim`, roda a FSM localmente sem FPGA.
 - **Teclas (sim)**: D/F/J/K = trilhas 0-3 | SPACE = START/PAUSE | ESC = voltar (pausa)
 - **Configurações de som (estado SETTINGS = 7)**: na tela inicial, qualquer botão de trilha
@@ -25,6 +26,23 @@ FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
   J = agudos (2–6 kHz), K = brilho (> 6 kHz). A FPGA guarda os níveis (`eq_config.v`, zeram
   só no reset) e os envia no pacote; o PC filtra o WAV por FFT (`_eq_wav_bytes`) e toca uma
   prévia de 10 s em loop enquanto o jogador ajusta.
+- **Dashboard de fim de sessão (DASHBOARD_SESSAO)**: ao fim da música (WIN/LOSE) o PC mostra
+  taxa de acerto, assincronia média e desvio-padrão (ms), maior combo, acertos por trilha e por
+  mão (D+F, J+K) e a variação em relação à sessão anterior do mesmo pseudônimo. Gesto e
+  metrônomo aparecem como "ainda não disponível". A tela é estática (sem piscar).
+  - **Métricas na FPGA** (`metricas.v`, dentro do `fluxo_dados`): a cada acerto,
+    `e = age − 130` quadros (negativo = adiantado); acumula N, Σe, Σ|e|, Σe², notas julgadas e
+    acertos por trilha (12 bits) e o maior combo. Zera em COUNTDOWN; congela em PAUSE/END/IDLE.
+    O PC calcula média = Σe/N e desvio = √(Σe²/N − média²), × 16,7 ms.
+  - **Taxa nos displays (TAXA_HEX)**: no END, HEX2–HEX0 mostram ⌊100·N/notas⌋ (divisor
+    sequencial `taxa_acerto.v`), sem zeros à esquerda; fora do END, HEX0 = estado,
+    HEX1 = jogada, HEX2 apagado. Porta nova `db_hex2` no top (pinos Y19…AB21, mesma ordem
+    de bits do HEX0/HEX1 — a ordem dos pinos HEX ainda é item de bancada).
+  - **Histórico local**: `--pseudonimo NOME` (só letras, dígitos, `_`, `-`; nunca o nome da
+    criança). Cada música terminada vira uma linha em `sessoes/sessoes.csv` (`--historico` muda
+    o caminho; a pasta está no `.gitignore`). Falha de disco só gera aviso. É a base do MQTT
+    da Semana 4 (mesmos campos, `session_row`). Se a interface abrir com a música já no fim,
+    a sessão não é gravada.
 
 ---
 
@@ -57,6 +75,12 @@ Charts `.hex` gerados automaticamente em `rtl/` no startup do SimulationEngine: 
   do alvo (Hobbits e Pokémon no "fácil").
 - `_DIFF_PRESETS["facil"] = (60, 30, 1)`: 60 frames (1 s) entre notas da mesma trilha e 30
   (0,5 s) entre quaisquer notas; max_sim não se aplica (a melodia é monofônica).
+- **Toda nota é julgada antes do fim:** só entram notas com `frame + 153 < total_frames`, para
+  acertar ou escapar antes do END (senão ficariam fora das métricas). Contagens atuais:
+  74 / 57 / 86 / 67.
+- `HIT_AGE = 130` (centro da janela, igual ao `HIT_CENTER` do `note_track.v`). Antes era
+  `HIT_Y // NOTE_SPEED` = 129.0 por erro de ponto flutuante, o que deslocava os charts 1 quadro
+  e enviesaria a assincronia em −17 ms.
 
 **Sincronia chart × áudio:**
 - Os WAVs são renderizações dos MIDIs: alinhados, sem deriva (medido por correlação de onsets).
@@ -76,7 +100,7 @@ linhas 28-35   : _AUDIO_BUFFER=16384 + pygame.mixer.pre_init(44100,-16,2,_AUDIO_
                  pre_init ANTES de pygame.init() — evita double-init
 linhas 52-55   : FPS=60, AUDIO_LATENCY_FRAMES=round(_AUDIO_BUFFER/44100*FPS) ≈ 22
                  Compensa latencia do buffer: notas spawnam AUDIO_LATENCY_FRAMES mais tarde
-linhas 56-74   : HIT_AGE = HIT_Y // NOTE_SPEED  ← float! usar int(HIT_AGE) em índices
+linhas 56-74   : HIT_AGE = round(HIT_Y / NOTE_SPEED) = 130 (int)
 linhas 100-140 : SONG_DURATION_MS, ROM_DEPTH, SONGS[], PACKET_SIZE
 linhas 265-350 : _midi_to_chart(song_config=None, save_hex=False)
 linhas 328-490 : class SimulationEngine
@@ -111,7 +135,7 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 
 ## Protocolo UART (FPGA → Python)
 
-Pacote de 22 bytes a 60fps:
+Pacote de 46 bytes a 60fps (~4 ms de transmissão por quadro de 16,7 ms):
 ```
 [0]  = 0x55 (header)
 [1]  = {eq[3:0], state}: state nos 4 bits baixos (0=idle,1=countdown,2=play,3=pause,
@@ -122,7 +146,14 @@ Pacote de 22 bytes a 60fps:
 [17] = misses
 [18] = combo
 [19..20] = song_id ([19] bits 7-6) + frame_counter (14 bits: [19]bits13-8, [20]bits7-0)
-[21] = 0xAA (footer)
+--- métricas da sessão (metricas.v) ---
+[21] = maior combo
+[22..23] = N, acertos em botão (16 bits)
+[24..26] = Σe (24 bits, complemento de 2)
+[27..29] = Σ|e| (24 bits)
+[30..32] = Σe² (24 bits)
+[33..44] = por trilha t, 3 bytes a partir de 33+3t: {notas[t] 12 bits, acertos[t] 12 bits}
+[45] = 0xAA (footer)
 ```
 
 ---
@@ -131,6 +162,7 @@ Pacote de 22 bytes a 60fps:
 
 ```bash
 uv run pc/interface.py --sim          # modo simulação (sem FPGA)
+uv run pc/interface.py --sim --pseudonimo ana01   # grava o histórico e compara sessões
 uv run --extra fpga pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
 python pc/interface.py --port COM3    # modo FPGA (Windows)
 python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
@@ -162,9 +194,18 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose; idle↔settings) |
 | `eq_config.v` | Níveis do atenuador de frequências (2 bits por faixa) |
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
-| `packet_sender.v` | Serializa estado em pacote UART |
-| `note_track.v` | 1 trilha com 3 slots de nota |
+| `packet_sender.v` | Serializa estado em pacote UART (46 bytes) |
+| `note_track.v` | 1 trilha com 3 slots de nota; `hit_age` = idade da nota acertada |
+| `metricas.v` | Acumuladores da sessão: N, Σe, Σ\|e\|, Σe², notas/acertos por trilha, maior combo |
+| `taxa_acerto.v` | Divisor sequencial: taxa de acerto em % e dígitos para o HEX |
 | `debounce_pulse.v` | Debounce + detecção de borda |
 | `contador_m.v` | Contador parametrizável |
 
-Testbenches (`tb/`): `tb_fd.v`, `tb_uc_ganha.v`, `tb_uc_perde.v`, `tb_countdown_transition.v`, etc.
+Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note_track` reais),
+`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (46 bytes),
+`tb_note_track.v`, `tb_fd.v`, `tb_uc_*.v`, etc. `tb_countdown_transition.v` falha desde antes
+(segura o reset ativo e referencia um `u_game_timer` que não existe).
+
+Rodar sem o script `check`: `iverilog -g2012 -o .sim/X.out -s X rtl/*.v tb/X.v && vvp -n .sim/X.out`.
+O `make yosys` não funciona no macOS (o `sed` do BSD não aceita `\|`); rodar o yosys à mão
+com a lista de fontes do `.qsf`.

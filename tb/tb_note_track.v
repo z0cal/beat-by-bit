@@ -36,6 +36,7 @@ module tb_note_track;
 
     wire [7:0] note0, note1, note2;
     wire hit_pulse, escape_pulse, bad_press;
+    wire [7:0] hit_age;
 
     note_track dut (
         .clock       (clock),
@@ -49,7 +50,8 @@ module tb_note_track;
         .note2       (note2),
         .hit_pulse   (hit_pulse),
         .escape_pulse(escape_pulse),
-        .bad_press   (bad_press)
+        .bad_press   (bad_press),
+        .hit_age     (hit_age)
     );
 
     always #(CLK_PERIOD/2) clock = ~clock;
@@ -150,6 +152,7 @@ module tb_note_track;
         `CHECK(note0 === 8'd119, "note0.age = 119 (borda inferior)")
         press;
         `CHECK(hit_pulse  === 1'b1, "Acerto na borda inferior (age=119)")
+        `CHECK(hit_age    === 8'd119, "hit_age = 119")
         `CHECK(bad_press  === 1'b0, "Sem bad_press no acerto")
         `CHECK(note0      === 8'hFF, "Nota removida (slot=0xFF)")
         @(posedge clock); #1;
@@ -161,6 +164,7 @@ module tb_note_track;
         `CHECK(note0 === 8'd130, "note0.age = 130 (centro)")
         press;
         `CHECK(hit_pulse === 1'b1, "Acerto no centro (age=130)")
+        `CHECK(hit_age   === 8'd130, "hit_age = 130")
         `CHECK(note0     === 8'hFF, "Nota removida no centro")
         @(posedge clock); #1;
 
@@ -170,6 +174,7 @@ module tb_note_track;
         `CHECK(note0 === 8'd141, "note0.age = 141 (borda superior)")
         press;
         `CHECK(hit_pulse === 1'b1, "Acerto na borda superior (age=141)")
+        `CHECK(hit_age   === 8'd141, "hit_age = 141")
         `CHECK(note0     === 8'hFF, "Nota removida na borda superior")
         @(posedge clock); #1;
 

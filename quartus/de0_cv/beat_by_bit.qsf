@@ -71,10 +71,12 @@ set_global_assignment -name VERILOG_FILE ../../rtl/fluxo_dados.v
 set_global_assignment -name VERILOG_FILE ../../rtl/gpio_test.v
 set_global_assignment -name VERILOG_FILE ../../rtl/hexa7seg.v
 set_global_assignment -name VERILOG_FILE ../../rtl/lfsr8.v
+set_global_assignment -name VERILOG_FILE ../../rtl/metricas.v
 set_global_assignment -name VERILOG_FILE ../../rtl/note_track.v
 set_global_assignment -name VERILOG_FILE ../../rtl/packet_sender.v
 set_global_assignment -name VERILOG_FILE ../../rtl/projeto.v
 set_global_assignment -name VERILOG_FILE ../../rtl/registrador_4.v
+set_global_assignment -name VERILOG_FILE ../../rtl/taxa_acerto.v
 set_global_assignment -name VERILOG_FILE ../../rtl/uart_tx.v
 set_global_assignment -name VERILOG_FILE ../../rtl/unidade_controle.v
 # <<< fpga-sync <<<
@@ -98,6 +100,13 @@ set_location_assignment PIN_AA18 -to db_jogada[3]
 set_location_assignment PIN_AB18 -to db_jogada[2]
 set_location_assignment PIN_AA17 -to db_jogada[1]
 set_location_assignment PIN_U22 -to db_jogada[0]
+set_location_assignment PIN_Y19 -to db_hex2[6]
+set_location_assignment PIN_AB17 -to db_hex2[5]
+set_location_assignment PIN_AA10 -to db_hex2[4]
+set_location_assignment PIN_Y14 -to db_hex2[3]
+set_location_assignment PIN_V14 -to db_hex2[2]
+set_location_assignment PIN_AB22 -to db_hex2[1]
+set_location_assignment PIN_AB21 -to db_hex2[0]
 set_location_assignment PIN_AA2 -to leds_pulsos[4]
 set_location_assignment PIN_AA1 -to leds_pulsos[3]
 set_location_assignment PIN_W2 -to leds_pulsos[2]

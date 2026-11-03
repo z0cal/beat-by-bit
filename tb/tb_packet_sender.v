@@ -3,12 +3,14 @@
  * Modulo    : packet_sender (inclui uart_tx internamente)
  *-----------------------------------------------------------------------
  * Testa:
- *   1. Ao receber frame_tick, transmite os 22 bytes do pacote
+ *   1. Ao receber frame_tick, transmite os 46 bytes do pacote
  *   2. Sequencia correta dos bytes: 0x55, {eq, state}, {eq, countdown},
  *      notas, score_h, score_l, misses, combo, {song_id, frame_h},
- *      frame_l, 0xAA
+ *      frame_l, metricas, 0xAA
  *   3. Niveis do atenuador nos nibbles altos dos bytes 1 e 2
- *   4. Um segundo frame_tick gera outro pacote
+ *   4. Metricas: soma_e negativa sai estendida em 24 bits; contadores
+ *      de 12 bits empacotados em 3 bytes por trilha
+ *   5. Um segundo frame_tick gera outro pacote
  *
  * Usa o packet_sender real com CLKS_PER_BIT=4 (uart_tx rapido).
  * Um receptor UART simples decodifica os bytes enviados.
@@ -20,7 +22,7 @@ module tb_packet_sender;
 
     localparam CLKS_PER_BIT = 4;
     localparam CLK_PERIOD   = 10;
-    localparam PACKET_SIZE  = 22;
+    localparam PACKET_SIZE  = 46;
 
     // DUT
     reg  clock      = 0;
@@ -40,6 +42,15 @@ module tb_packet_sender;
     reg [1:0]  song_id = 2'd2;
     // GRAVES=3, MEDIOS=0, AGUDOS=1, BRILHO=2
     reg [7:0]  eq = {2'd2, 2'd1, 2'd0, 2'd3};
+    // Metricas: soma_e = -2 (sinal), contadores por trilha distintos
+    reg [7:0]  met_max_combo = 8'd42;
+    reg [15:0] met_n         = 16'd1234;
+    reg [20:0] met_soma_e    = -21'sd2;
+    reg [19:0] met_soma_abs  = 20'hABCDE;
+    reg [22:0] met_soma_e2   = 23'h712345;
+    // notas[t] = 0x100+t, acertos[t] = 0x0F0+t  (12 bits cada)
+    reg [47:0] met_notas   = {12'h103, 12'h102, 12'h101, 12'h100};
+    reg [47:0] met_acertos = {12'h0F3, 12'h0F2, 12'h0F1, 12'h0F0};
 
     wire uart_tx_out;
 
@@ -59,6 +70,13 @@ module tb_packet_sender;
         .frame_counter(frame_counter),
         .song_id      (song_id),
         .eq           (eq),
+        .met_max_combo(met_max_combo),
+        .met_n        (met_n),
+        .met_soma_e   (met_soma_e),
+        .met_soma_abs (met_soma_abs),
+        .met_soma_e2  (met_soma_e2),
+        .met_notas    (met_notas),
+        .met_acertos  (met_acertos),
         .uart_tx_out  (uart_tx_out)
     );
 
@@ -130,7 +148,24 @@ module tb_packet_sender;
             expected[18] = combo;
             expected[19] = {song_id, frame_counter[13:8]};
             expected[20] = frame_counter[7:0];
-            expected[21] = 8'hAA;
+            expected[21] = met_max_combo;
+            expected[22] = met_n[15:8];
+            expected[23] = met_n[7:0];
+            expected[24] = {{3{met_soma_e[20]}}, met_soma_e[20:16]};
+            expected[25] = met_soma_e[15:8];
+            expected[26] = met_soma_e[7:0];
+            expected[27] = {4'd0, met_soma_abs[19:16]};
+            expected[28] = met_soma_abs[15:8];
+            expected[29] = met_soma_abs[7:0];
+            expected[30] = {1'b0, met_soma_e2[22:16]};
+            expected[31] = met_soma_e2[15:8];
+            expected[32] = met_soma_e2[7:0];
+            for (k = 0; k < 4; k = k + 1) begin
+                expected[33 + 3*k] = met_notas[12*k + 4 +: 8];
+                expected[34 + 3*k] = {met_notas[12*k +: 4], met_acertos[12*k + 8 +: 4]};
+                expected[35 + 3*k] = met_acertos[12*k +: 8];
+            end
+            expected[45] = 8'hAA;
         end
     endtask
 
@@ -157,6 +192,15 @@ module tb_packet_sender;
             $display("[FAIL] byte 2 esperado 0x90 (BRILHO=2, AGUDOS=1, countdown 0)");
             erros = erros + 1;
         end
+        // Literais: soma_e = -2 em 24 bits e a trilha 1 empacotada
+        if (expected[24] !== 8'hFF || expected[25] !== 8'hFF || expected[26] !== 8'hFE) begin
+            $display("[FAIL] soma_e=-2 deveria sair como FF FF FE");
+            erros = erros + 1;
+        end
+        if (expected[36] !== 8'h10 || expected[37] !== 8'h10 || expected[38] !== 8'hF1) begin
+            $display("[FAIL] trilha 1 (notas 0x101, acertos 0x0F1) deveria sair 10 10 F1");
+            erros = erros + 1;
+        end
         tick;
         check_packet("Pacote 1");
 
@@ -165,6 +209,8 @@ module tb_packet_sender;
         game_state    = 4'd1;
         countdown_sec = 8'd3;
         eq            = 8'h00;
+        met_soma_e    = 21'sd300;
+        met_n         = 16'd7;
         monta_esperado;
         tick;
         check_packet("Pacote 2");

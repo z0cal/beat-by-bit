@@ -17,6 +17,9 @@
  *   - Registrador song_id_reg para selecionar qual ROM usar
  *   - Registrador do atenuador de frequencias (eq_config), ajustado
  *     pelos botoes de trilha no estado SETTINGS
+ *   - Bloco de metricas da sessao (metricas.v): assincronia de cada
+ *     acerto, notas e acertos por trilha e maior combo. Zera em
+ *     COUNTDOWN e fica congelado em PAUSE, END e IDLE
  *-----------------------------------------------------------------------
  * Clock assumido: 50 MHz
  *   frame_tick: M = 833_333 ciclos (= 50MHz / 60fps)
@@ -74,7 +77,16 @@ module fluxo_dados (
     output wire [1:0]  song_id_out,
 
     // Niveis do atenuador de frequencias (2 bits por faixa, ver eq_config.v)
-    output wire [7:0]  eq_out
+    output wire [7:0]  eq_out,
+
+    // Metricas da sessao (ver metricas.v)
+    output wire [15:0] met_n,          // acertos em botao
+    output wire [20:0] met_soma_e,     // soma de e = age - 130, com sinal
+    output wire [19:0] met_soma_abs,   // soma de |e|
+    output wire [22:0] met_soma_e2,    // soma de e^2
+    output wire [47:0] met_notas,      // notas julgadas, 12 bits por trilha
+    output wire [47:0] met_acertos,    // acertos, 12 bits por trilha
+    output wire [7:0]  met_max_combo   // maior combo da sessao
 );
 
     // ----------------------------------------------------------------
@@ -246,13 +258,15 @@ module fluxo_dados (
     wire [3:0] hit_pulse;
     wire [3:0] escape_pulse;
     wire [3:0] bad_press;
+    wire [7:0] hit_age [0:3];   // idade da nota acertada, por trilha
 
     note_track u_track0 (
         .clock(clock), .reset(reset | limpaR),
         .frame_tick(frame_tick), .game_active(game_active),
         .spawn_en(spawn_en[0]), .btn_press(btn_pulse[0]),
         .note0(t0n0), .note1(t0n1), .note2(t0n2),
-        .hit_pulse(hit_pulse[0]), .escape_pulse(escape_pulse[0]), .bad_press(bad_press[0])
+        .hit_pulse(hit_pulse[0]), .escape_pulse(escape_pulse[0]), .bad_press(bad_press[0]),
+        .hit_age(hit_age[0])
     );
 
     note_track u_track1 (
@@ -260,7 +274,8 @@ module fluxo_dados (
         .frame_tick(frame_tick), .game_active(game_active),
         .spawn_en(spawn_en[1]), .btn_press(btn_pulse[1]),
         .note0(t1n0), .note1(t1n1), .note2(t1n2),
-        .hit_pulse(hit_pulse[1]), .escape_pulse(escape_pulse[1]), .bad_press(bad_press[1])
+        .hit_pulse(hit_pulse[1]), .escape_pulse(escape_pulse[1]), .bad_press(bad_press[1]),
+        .hit_age(hit_age[1])
     );
 
     note_track u_track2 (
@@ -268,7 +283,8 @@ module fluxo_dados (
         .frame_tick(frame_tick), .game_active(game_active),
         .spawn_en(spawn_en[2]), .btn_press(btn_pulse[2]),
         .note0(t2n0), .note1(t2n1), .note2(t2n2),
-        .hit_pulse(hit_pulse[2]), .escape_pulse(escape_pulse[2]), .bad_press(bad_press[2])
+        .hit_pulse(hit_pulse[2]), .escape_pulse(escape_pulse[2]), .bad_press(bad_press[2]),
+        .hit_age(hit_age[2])
     );
 
     note_track u_track3 (
@@ -276,7 +292,8 @@ module fluxo_dados (
         .frame_tick(frame_tick), .game_active(game_active),
         .spawn_en(spawn_en[3]), .btn_press(btn_pulse[3]),
         .note0(t3n0), .note1(t3n1), .note2(t3n2),
-        .hit_pulse(hit_pulse[3]), .escape_pulse(escape_pulse[3]), .bad_press(bad_press[3])
+        .hit_pulse(hit_pulse[3]), .escape_pulse(escape_pulse[3]), .bad_press(bad_press[3]),
+        .hit_age(hit_age[3])
     );
 
     // Slot livre por trilha: spawn permitido se qualquer dos 3 slots estiver vazio
@@ -357,6 +374,26 @@ module fluxo_dados (
             combo_reg <= 8'd0;
         end
     end
+
+    // ----------------------------------------------------------------
+    // Metricas da sessao: zera em COUNTDOWN (db_estado == 1)
+    // ----------------------------------------------------------------
+    metricas u_metricas (
+        .clock       (clock),
+        .reset       (reset),
+        .zera        (db_estado == 4'b0001),
+        .hit_pulse   (hit_pulse),
+        .hit_age     ({hit_age[3], hit_age[2], hit_age[1], hit_age[0]}),
+        .escape_pulse(escape_pulse),
+        .combo       (combo_reg),
+        .n_acertos   (met_n),
+        .soma_e      (met_soma_e),
+        .soma_abs    (met_soma_abs),
+        .soma_e2     (met_soma_e2),
+        .notas       (met_notas),
+        .acertos     (met_acertos),
+        .max_combo   (met_max_combo)
+    );
 
     assign combo             = combo_reg;
     assign frame_tick_out    = frame_tick;

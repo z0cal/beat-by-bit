@@ -3,13 +3,14 @@
  * Modulo    : packet_sender (inclui uart_tx internamente)
  *-----------------------------------------------------------------------
  * Testa:
- *   1. Ao receber frame_tick, transmite os 46 bytes do pacote
+ *   1. Ao receber frame_tick, transmite os 49 bytes do pacote
  *   2. Sequencia correta dos bytes: 0x55, {eq, state}, {eq, countdown},
  *      notas, score_h, score_l, misses, combo, {song_id, frame_h},
- *      frame_l, metricas, 0xAA
+ *      frame_l, metricas, nome do perfil, 0xAA
  *   3. Niveis do atenuador nos nibbles altos dos bytes 1 e 2
  *   4. Metricas: soma_e negativa sai estendida em 24 bits; contadores
  *      de 12 bits empacotados em 3 bytes por trilha
+ *   4b. Nome do perfil "AN0" com cursor 2 nos bytes 45-47
  *   5. Um segundo frame_tick gera outro pacote
  *
  * Usa o packet_sender real com CLKS_PER_BIT=4 (uart_tx rapido).
@@ -22,7 +23,7 @@ module tb_packet_sender;
 
     localparam CLKS_PER_BIT = 4;
     localparam CLK_PERIOD   = 10;
-    localparam PACKET_SIZE  = 46;
+    localparam PACKET_SIZE  = 49;
 
     // DUT
     reg  clock      = 0;
@@ -51,6 +52,9 @@ module tb_packet_sender;
     // notas[t] = 0x100+t, acertos[t] = 0x0F0+t  (12 bits cada)
     reg [47:0] met_notas   = {12'h103, 12'h102, 12'h101, 12'h100};
     reg [47:0] met_acertos = {12'h0F3, 12'h0F2, 12'h0F1, 12'h0F0};
+    // Nome "AN0" (A=1, N=14, 0=27), cursor na posicao 2
+    reg [17:0] nome        = {6'd27, 6'd14, 6'd1};
+    reg [1:0]  nome_cursor = 2'd2;
 
     wire uart_tx_out;
 
@@ -77,6 +81,8 @@ module tb_packet_sender;
         .met_soma_e2  (met_soma_e2),
         .met_notas    (met_notas),
         .met_acertos  (met_acertos),
+        .nome         (nome),
+        .nome_cursor  (nome_cursor),
         .uart_tx_out  (uart_tx_out)
     );
 
@@ -165,7 +171,10 @@ module tb_packet_sender;
                 expected[34 + 3*k] = {met_notas[12*k +: 4], met_acertos[12*k + 8 +: 4]};
                 expected[35 + 3*k] = met_acertos[12*k +: 8];
             end
-            expected[45] = 8'hAA;
+            expected[45] = {nome_cursor, nome[5:0]};
+            expected[46] = {2'b00, nome[11:6]};
+            expected[47] = {2'b00, nome[17:12]};
+            expected[48] = 8'hAA;
         end
     endtask
 
@@ -201,6 +210,10 @@ module tb_packet_sender;
             $display("[FAIL] trilha 1 (notas 0x101, acertos 0x0F1) deveria sair 10 10 F1");
             erros = erros + 1;
         end
+        if (expected[45] !== 8'h81 || expected[46] !== 8'h0E || expected[47] !== 8'h1B) begin
+            $display("[FAIL] nome AN0 com cursor 2 deveria sair 81 0E 1B");
+            erros = erros + 1;
+        end
         tick;
         check_packet("Pacote 1");
 
@@ -211,6 +224,8 @@ module tb_packet_sender;
         eq            = 8'h00;
         met_soma_e    = 21'sd300;
         met_n         = 16'd7;
+        nome          = 18'd0;
+        nome_cursor   = 2'd0;
         monta_esperado;
         tick;
         check_packet("Pacote 2");

@@ -2,11 +2,12 @@
  * Arquivo   : packet_sender.v
  * Projeto   : Beat by Bit - Semestre 2
  *-----------------------------------------------------------------------
- * Descricao : Monta e envia um pacote de 46 bytes via UART a cada
+ * Descricao : Monta e envia um pacote de 49 bytes via UART a cada
  *             frame_tick. Aguarda o uart_tx ficar pronto entre bytes.
- *             46 bytes a 115200 baud levam ~4 ms (o quadro tem 16,7 ms).
+ *             49 bytes levam ~0,5 ms a 1 Mbaud (~4,3 ms a 115200); o
+ *             quadro tem 16,7 ms.
  *
- * Formato do pacote (46 bytes, valores multibyte em big-endian):
+ * Formato do pacote (49 bytes, valores multibyte em big-endian):
  *   [0]    0x55          marcador de inicio
  *   [1]    {eq[3:0], game_state}
  *            game_state  0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
@@ -35,12 +36,17 @@
  *  [30-32] soma de e^2  (24 bits)
  *  [33-44] por trilha t (3 bytes cada, a partir de 33 + 3t):
  *            {notas[t][11:0], acertos[t][11:0]}
- *  [45]    0xAA          marcador de fim
+ *  --- nome do perfil (nome_perfil.v) ---
+ *  [45]    {cursor[1:0], c0}   c0 = caractere da esquerda
+ *  [46]    {2'b00, c1}
+ *  [47]    {2'b00, c2}
+ *            caractere: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
+ *  [48]    0xAA          marcador de fim
  *-----------------------------------------------------------------------
  */
 
 module packet_sender #(
-    parameter CLKS_PER_BIT = 434     // 50 MHz / 115200 baud; o TB encurta
+    parameter CLKS_PER_BIT = 50      // 50 MHz / 1 Mbaud (o top passa o valor); o TB encurta
 ) (
     input  wire        clock,
     input  wire        reset,
@@ -79,6 +85,10 @@ module packet_sender #(
     input  wire [47:0] met_notas,      // 12 bits por trilha
     input  wire [47:0] met_acertos,    // 12 bits por trilha
 
+    // Nome do perfil (ver nome_perfil.v)
+    input  wire [17:0] nome,
+    input  wire [1:0]  nome_cursor,
+
     // Saida serial
     output wire        uart_tx_out
 );
@@ -97,7 +107,7 @@ module packet_sender #(
         .tx_ready  (tx_ready)
     );
 
-    localparam integer PACKET_SIZE = 46;
+    localparam integer PACKET_SIZE = 49;
 
     // Maquina de estados: espera frame_tick, depois envia PACKET_SIZE bytes
     localparam WAIT   = 2'd0;  // aguardando proximo frame
@@ -161,7 +171,10 @@ module packet_sender #(
                                               met_acertos[12*t + 8 +: 4]};
                             pkt[35 + 3*t] <= met_acertos[12*t +: 8];
                         end
-                        pkt[45] <= 8'hAA;
+                        pkt[45] <= {nome_cursor, nome[5:0]};
+                        pkt[46] <= {2'b00, nome[11:6]};
+                        pkt[47] <= {2'b00, nome[17:12]};
+                        pkt[48] <= 8'hAA;
                         byte_idx <= 0;
                         state    <= LOAD;
                     end

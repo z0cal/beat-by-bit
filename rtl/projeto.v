@@ -10,10 +10,17 @@
  *   HEX2 apagado.
  *   No fim de musica (END_WIN/END_LOSE): HEX2-HEX0 = taxa de acerto em
  *   porcentagem (TAXA_HEX), sem zeros a esquerda. Ex.: 100, 87, 5.
+ *
+ * Serial (8N1): BAUD define a velocidade de TX (pacotes) e RX (ACK).
+ *   O PC usa o mesmo valor (--baud, padrao 1000000). Para voltar a
+ *   115200, troque BAUD aqui e rode o PC com --baud 115200.
  *-----------------------------------------------------------------------
  */
 
-module beat_by_bit (
+module beat_by_bit #(
+    parameter CLK_HZ = 50_000_000,
+    parameter BAUD   = 1_000_000     // 50 MHz / 1 Mbaud = 50 ciclos/bit (exato)
+) (
     input  wire        clock,
     input  wire        reset,
     input  wire [4:0]  botoes,
@@ -22,13 +29,15 @@ module beat_by_bit (
     output wire [6:0]  db_hex2,      // HEX2: centena da taxa de acerto (no END)
     output wire [4:0]  leds_pulsos,  // LEDs de debug
     output wire [4:0]  db_botoes_raw,// Debug: botoes crus (LEDR 5-9)
-    output wire        uart_tx_out,  // TX serial para o PC (115200 baud)
+    output wire        uart_tx_out,  // TX serial para o PC (BAUD)
     input  wire        uart_rx_in    // RX serial: ACK do PC (TXD do CP2102)
 );
 
     // Reset invertido: o pino GPIO tem pull-up (1 quando solto),
     // mas o circuito usa reset ativo em 1, entao invertemos.
     wire reset_i = ~reset;
+
+    localparam CLKS_PER_BIT = CLK_HZ / BAUD;
 
     // Fios entre UC e FD
     wire s_registraR, s_limpaR;
@@ -58,6 +67,10 @@ module beat_by_bit (
     wire [22:0] s_met_soma_e2;
     wire [47:0] s_met_notas, s_met_acertos;
     wire [7:0]  s_met_max_combo;
+
+    // Nome do perfil (FD -> packet_sender)
+    wire [17:0] s_nome;
+    wire [1:0]  s_nome_cursor;
 
     // LEDR3 = link serial ok (PC recebendo pacotes); perdeu e fixo em 0
     assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_link_ok, s_jogada_feita};
@@ -123,13 +136,15 @@ module beat_by_bit (
         .met_soma_e2       (s_met_soma_e2),
         .met_notas         (s_met_notas),
         .met_acertos       (s_met_acertos),
-        .met_max_combo     (s_met_max_combo)
+        .met_max_combo     (s_met_max_combo),
+        .nome_out          (s_nome),
+        .nome_cursor       (s_nome_cursor)
     );
 
     // ----------------------------------------------------------------
     // Packet Sender (monta e envia pacote UART a cada frame)
     // ----------------------------------------------------------------
-    packet_sender u_pkt (
+    packet_sender #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_pkt (
         .clock        (clock),
         .reset        (reset_i),
         .frame_tick   (s_frame_tick),
@@ -152,13 +167,15 @@ module beat_by_bit (
         .met_soma_e2   (s_met_soma_e2),
         .met_notas     (s_met_notas),
         .met_acertos   (s_met_acertos),
+        .nome          (s_nome),
+        .nome_cursor   (s_nome_cursor),
         .uart_tx_out   (uart_tx_out)
     );
 
     // ----------------------------------------------------------------
     // Link serial: acende LEDR3 enquanto o PC devolve ACKs
     // ----------------------------------------------------------------
-    uart_link u_link (
+    uart_link #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_link (
         .clock    (clock),
         .reset    (reset_i),
         .rx_serial(uart_rx_in),

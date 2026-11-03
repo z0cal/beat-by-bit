@@ -72,6 +72,7 @@ set_global_assignment -name VERILOG_FILE ../../rtl/gpio_test.v
 set_global_assignment -name VERILOG_FILE ../../rtl/hexa7seg.v
 set_global_assignment -name VERILOG_FILE ../../rtl/lfsr8.v
 set_global_assignment -name VERILOG_FILE ../../rtl/metricas.v
+set_global_assignment -name VERILOG_FILE ../../rtl/nome_perfil.v
 set_global_assignment -name VERILOG_FILE ../../rtl/note_track.v
 set_global_assignment -name VERILOG_FILE ../../rtl/packet_sender.v
 set_global_assignment -name VERILOG_FILE ../../rtl/projeto.v

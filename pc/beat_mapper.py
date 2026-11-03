@@ -223,7 +223,7 @@ def print_stats(rom):
     """Exibe estatisticas da ROM gerada."""
     total = sum(1 for b in rom if b)
     per_lane = [sum(1 for b in rom if b & (1 << i)) for i in range(NUM_LANES)]
-    duration_s = len(rom) / GAME_FPS
+    duration_s = max(len(rom) / GAME_FPS, 1e-9)  # evita divisao por zero com ROM vazia
     print()
     print("── Estatisticas ─────────────────────────────")
     print(f"   Duracao:        {duration_s:.0f}s ({len(rom)} frames)")
@@ -261,7 +261,7 @@ def show_preview(rom, y, sr):
     labels = ['T0 graves', 'T1 med-baixo', 'T2 med-alto', 'T3 agudos']
     for i in range(NUM_LANES):
         ax = axes[i + 1]
-        note_times = [f / GAME_FPS for f in range(len(rom)) if rom[f] & (1 << i)]
+        note_times = np.flatnonzero(rom & (1 << i)) / GAME_FPS
         ax.vlines(note_times, 0, 1, color=colors[i], linewidth=1.2, alpha=0.85)
         ax.set_ylabel(labels[i], fontsize=8, color=colors[i])
         ax.set_ylim(0, 1.2)

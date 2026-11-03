@@ -1,0 +1,264 @@
+% Compilar: latexmk -lualatex cola_beat_by_bit.tex
+\documentclass[9pt,a4paper]{extarticle}
+
+\usepackage{fontspec}
+\usepackage[brazilian]{babel}
+\usepackage[a4paper,margin=11mm,top=10mm,bottom=12mm]{geometry}
+\usepackage{tabularx,booktabs,array}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{tikz}
+\usepackage[american]{circuitikz}
+\usepackage[hidelinks]{hyperref}
+\usetikzlibrary{positioning,calc,arrows.meta,decorations.pathreplacing}
+
+\setmainfont{TeX Gyre Heros}
+\setmonofont{DejaVu Sans Mono}[Scale=0.88]
+
+\titleformat{\section}{\normalsize\bfseries\color{blue!55!black}}{}{0pt}{}
+\titlespacing*{\section}{0pt}{7pt}{3pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\setlist{nosep,leftmargin=12pt}
+\renewcommand{\arraystretch}{1.12}
+\setlength{\tabcolsep}{4pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\s}[1]{\texttt{#1}}          % sinal / codigo
+\pagestyle{plain}
+
+\begin{document}
+
+{\large\bfseries Cola de montagem --- Beat by Bit (PCS3645)}\hfill
+{\small T1BA5 · top \s{beat\_by\_bit} · 27/10/2026}
+
+% ==========================================================================
+\section{Guia de montagem (DE0-CV)}
+
+Placa desligada até terminar a montagem. Tudo vai no JP1 (GPIO\_0); o JP2 fica livre.
+Conferir o pino 1 do conector pela marcação da placa.
+
+\begin{center}
+\begin{tikzpicture}[
+    pin/.style={circle, draw=black!35, fill=white, inner sep=0pt, minimum size=2.3mm},
+    pwr/.style={pin, draw=red!60!black, fill=red!55},
+    gnd/.style={pin, draw=black, fill=black!75},
+    sig/.style={pin, draw=blue!60!black, fill=blue!45},
+    saida/.style={pin, draw=green!45!black, fill=green!55},
+    tag/.style={font=\footnotesize, inner sep=1pt},
+    num/.style={font=\tiny, text=black!55},
+    ld/.style={draw=black!55}
+  ]
+  \def\sp{0.36}
+  % \conector{nome}{x}{rotulo}: 20 linhas de 2 pinos (impares a esquerda)
+  \newcommand{\conector}[3]{
+    \draw[rounded corners=1pt, draw=black!35, fill=black!4]
+      (#2-0.2, 0.2) rectangle (#2+0.62, -19*\sp-0.2);
+    \foreach \l in {0,...,19} {
+      \pgfmathtruncatemacro{\pinimpar}{2*\l+1}
+      \pgfmathtruncatemacro{\pinpar}{2*\l+2}
+      \node[pin] (#1-\pinimpar) at (#2, -\l*\sp) {};
+      \node[pin] (#1-\pinpar)   at (#2+0.42, -\l*\sp) {};
+    }
+    \node[font=\footnotesize\bfseries, anchor=south] at (#2+0.21, 0.25) {#3};
+  }
+  % rotulos: \esq{pino}{texto} a esquerda (impares), \dir{pino}{texto} a direita (pares)
+  \newcommand{\esq}[2]{\draw[ld] (#1.west) -- ++(-0.3,0) node[tag, anchor=east] {#2};}
+  \newcommand{\dir}[2]{\draw[ld] (#1.east) -- ++(0.3,0) node[tag, anchor=west] {#2};}
+
+  \conector{JP1}{7.4}{JP1 · GPIO\_0}
+  \node[saida] at (JP1-1) {};
+  \node[sig] at (JP1-2) {};
+  \node[gnd] at (JP1-12) {};  \node[gnd] at (JP1-30) {};
+  \node[pwr] at (JP1-29) {};
+  \node[sig] at (JP1-16) {};
+  \node[sig] at (JP1-36) {};  \node[sig] at (JP1-37) {};  \node[sig] at (JP1-38) {};
+  \node[sig] at (JP1-39) {};  \node[sig] at (JP1-40) {};
+  \node[num, anchor=south] at (JP1-1.north) {1};
+  \node[num, anchor=north] at (JP1-39.south) {39};
+  \node[num, anchor=north] at (JP1-40.south) {40};
+
+  \esq{JP1-1}{1 · \s{uart\_tx\_out} $\to$ RXD do CP2102}
+  \esq{JP1-11}{11 · 5\,V da placa: \textbf{não usar}}
+  \esq{JP1-29}{29 · 3,3\,V $\to$ trilho $+$ dos pull-ups (\textbf{nunca 5\,V})}
+  \esq{JP1-37}{37 · \s{botoes[1]} · trilha 1}
+  \esq{JP1-39}{39 · \s{botoes[0]} · trilha 0}
+  \dir{JP1-2}{2 · \s{uart\_rx\_in} $\leftarrow$ TXD do CP2102}
+  \dir{JP1-12}{12 · GND $\to$ GND do CP2102}
+  \dir{JP1-16}{16 · \s{reset} (apertado = reset)}
+  \dir{JP1-30}{30 · GND $\to$ trilho $-$ dos botões}
+  \dir{JP1-36}{36 · \s{botoes[4]} · START / PAUSE}
+  \dir{JP1-38}{38 · \s{botoes[3]} · trilha 3}
+  \dir{JP1-40}{40 · \s{botoes[2]} · trilha 2}
+\end{tikzpicture}
+\hspace{4mm}
+\begin{circuitikz}[scale=0.8, transform shape, font=\footnotesize]
+  \node[font=\footnotesize\bfseries, anchor=south] at (1.2, 4.35) {cada entrada (6×)};
+  \draw (0,4) node[left] {3,3\,V (pino 29)} -- (2.4,4);
+  \draw (1.2,4) to[R, l_=10\,k$\Omega$] (1.2,2) node[circ] {};
+  \draw (1.2,2) -- (2.6,2) node[right, align=left] {pino do\\botão/\s{reset}};
+  \draw (1.2,2) to[push button] (1.2,0) node[ground] {};
+  \node[right] at (1.45,-0.25) {GND (pino 30)};
+  % CP2102: os fios cruzam (TX -> RX)
+  \begin{scope}[shift={(-0.6,-2.2)}]
+    \node[font=\footnotesize\bfseries, anchor=south] at (2.0, -0.05) {CP2102 (fios cruzados)};
+    \node[draw=black!50, fill=black!4, rounded corners=2pt, minimum width=1.3cm,
+          minimum height=2.6cm] (cp) at (3.6,-1.5) {};
+    \node[font=\scriptsize\bfseries, rotate=90] at (3.95,-1.5) {CP2102 · USB};
+    \foreach \y/\jp/\cpn/\cor in {-0.6/pino 1 (TX)/RXD/green!45!black,
+                                  -1.5/pino 2 (RX)/TXD/blue!60!black,
+                                  -2.4/pino 12 (GND)/GND/black} {
+      \node[font=\scriptsize, anchor=east] at (0.6,\y) {\jp};
+      \node[font=\scriptsize\ttfamily, anchor=west] at (3.0,\y) {\cpn};
+    }
+    \draw[-{Latex[length=1.6mm]}, thick, green!45!black] (0.65,-0.6) -- (2.95,-0.6);
+    \draw[{Latex[length=1.6mm]}-, thick, blue!60!black]  (0.65,-1.5) -- (2.95,-1.5);
+    \draw[thick] (0.65,-2.4) -- (2.95,-2.4);
+    \node[font=\scriptsize, text=black!60, align=left, anchor=north west] at (0.0,-2.7)
+      {3V3, 5V, DTR, CTS: livres};
+  \end{scope}
+\end{circuitikz}
+\end{center}
+
+\textcolor{red!60!black}{$\bullet$} alimentação ·
+$\bullet$ GND (pinos 12 e 30, ligados entre si na placa) ·
+\textcolor{blue!60!black}{$\bullet$} entrada ·
+\textcolor{green!45!black}{$\bullet$} saída · $\circ$ não ligar.
+Ímpares à esquerda, pares à direita.
+
+\textbf{Protoboard.} Pino 29 (3,3\,V) no trilho $+$ e pino 30 (GND) no trilho $-$.
+Para cada um dos 6 botões: uma perna no trilho $-$; na outra perna, um resistor de
+10\,k$\Omega$ até o trilho $+$ e um fio até o pino do JP1 da tabela. Solto, o pino
+fica em 1; apertado, vai a 0. O 3,3\,V (29) é vizinho do GND (30): um fio deslocado
+dá curto.
+
+\textbf{CP2102.} Três fios, cruzados: RXD no pino 1 (TX da FPGA), TXD no pino 2 (RX da
+FPGA) e GND no pino 12. O 3V3 e o 5V do CP2102 ficam livres (ele é alimentado pelo USB).
+Com o jogo rodando no PC, \textbf{LEDR3 aceso} confirma a serial nos dois sentidos.
+
+\begin{tabularx}{\linewidth}{@{}l l l l Y@{}}
+\toprule
+Sinal & Pino JP1 & Pino FPGA & Liga em & Função \\
+\midrule
+\s{uart\_tx\_out} & 1  & N16 & RXD do CP2102          & pacotes de 22\,B a 115\,200 baud, 60 por segundo \\
+\s{uart\_rx\_in}  & 2  & B16 & TXD do CP2102          & ACK do PC (0xA5 a cada 0,25\,s) acende LEDR3 \\
+GND               & 12 & --- & GND do CP2102          & referência comum \\
+\s{reset}         & 16 & T22 & botão $+$ pull-up      & apertado (0 no pino) zera o jogo para IDLE \\
+3,3\,V            & 29 & --- & trilho $+$             & alimenta os 6 pull-ups \\
+GND               & 30 & --- & trilho $-$             & uma perna de cada botão \\
+\s{botoes[4]}     & 36 & T20 & botão $+$ pull-up      & START / PAUSE \\
+\s{botoes[1]}     & 37 & T19 & botão $+$ pull-up      & trilha 1 · música 1 (Song of Storms) \\
+\s{botoes[3]}     & 38 & T18 & botão $+$ pull-up      & trilha 3 \\
+\s{botoes[0]}     & 39 & T17 & botão $+$ pull-up      & trilha 0 · música 0 (Concerning Hobbits) \\
+\s{botoes[2]}     & 40 & T15 & botão $+$ pull-up      & trilha 2 · música 2 (Power Rangers) \\
+\bottomrule
+\end{tabularx}
+
+{\footnotesize O debounce dispara na \textbf{subida} do sinal: com pull-up, a jogada
+conta quando o botão é \textbf{solto}, e novos toques ficam bloqueados por 180\,ms.
+Clock: \s{clock} = CLOCK\_50 da placa (M9), sem fio.}
+
+\clearpage
+% ==========================================================================
+\section{Placa: o que cada display e LED mostra}
+
+% Display de 7 segmentos: segmentos a..g (1 = aceso)
+\tikzset{
+  segon/.style={line width=2pt, line cap=round, draw=red!80!black},
+  segoff/.style={line width=2pt, line cap=round, draw=black!8},
+}
+\newcommand{\seg}[2]{\ifnum#1=1 \draw[segon] #2;\else\draw[segoff] #2;\fi}
+\newcommand{\sete}[8]{%
+  \begin{scope}[shift={#1}, scale=0.62, xslant=0.1]
+    \draw[rounded corners=1.5pt, draw=black!35, fill=black!2] (-0.2,-0.2) rectangle (0.8,1.2);
+    \seg{#2}{(0.12,1.0)--(0.48,1.0)}%
+    \seg{#3}{(0.6,0.88)--(0.6,0.6)}%
+    \seg{#4}{(0.6,0.4)--(0.6,0.12)}%
+    \seg{#5}{(0.12,0.0)--(0.48,0.0)}%
+    \seg{#6}{(0.0,0.4)--(0.0,0.12)}%
+    \seg{#7}{(0.0,0.88)--(0.0,0.6)}%
+    \seg{#8}{(0.12,0.5)--(0.48,0.5)}%
+  \end{scope}}
+\newcommand{\hexdig}[2]{\ifcase"#2 \sete{#1}1111110\or\sete{#1}0110000\or
+  \sete{#1}1101101\or\sete{#1}1111001\or\sete{#1}0110011\or\sete{#1}1011011\or
+  \sete{#1}1011111\or\sete{#1}1110000\or\sete{#1}1111111\or\sete{#1}1111011\or
+  \sete{#1}1110111\or\sete{#1}0011111\or\sete{#1}1001110\or\sete{#1}0111101\or
+  \sete{#1}1001111\or\sete{#1}1000111\fi}
+\newcommand{\apagado}[1]{\sete{#1}0000000}
+
+Da esquerda para a direita, como na placa. Exemplo do desenho: jogo em PLAY, nenhum
+botão apertado e última jogada com todos os botões soltos. Chaves SW9..0 e displays
+HEX5..2 não são usados.
+
+\begin{center}
+\begin{tikzpicture}[
+    ledon/.style={circle, draw=red!60!black, minimum size=3.4mm, inner sep=0pt, fill=red!75},
+    ledoff/.style={circle, draw=red!60!black, minimum size=3.4mm, inner sep=0pt, fill=white},
+    rot/.style={font=\scriptsize, align=center, text width=1.5cm, inner sep=1pt},
+    tit/.style={font=\scriptsize\bfseries, text=black!65, inner sep=1pt}
+  ]
+  \def\L{1.62}
+  % displays: HEX5 a HEX0
+  \foreach \k [count=\i from 0] in {5,4,3,2,1,0}
+    \node[tit] at (5.45+\i*0.8+0.2, -0.32) {HEX\k};
+  \apagado{(5.45+0*0.8,0)}
+  \apagado{(5.45+1*0.8,0)}
+  \apagado{(5.45+2*0.8,0)}
+  \apagado{(5.45+3*0.8,0)}
+  \hexdig{(5.45+4*0.8,0)}{F}
+  \hexdig{(5.45+5*0.8,0)}{2}
+  \node[font=\scriptsize, text=black!65, anchor=west] at (10.4, 0.62) {HEX1: botões 3..0 na última jogada};
+  \node[font=\scriptsize, text=black!65, anchor=west] at (10.4, 0.25) {HEX0: estado da FSM};
+  % LEDs: LEDR9 a LEDR0
+  \foreach \nome/\txt/\est [count=\i from 0] in {
+      LEDR9/{START\\cru}/ledon,
+      LEDR8/{botão 3\\cru}/ledon,
+      LEDR7/{botão 2\\cru}/ledon,
+      LEDR6/{botão 1\\cru}/ledon,
+      LEDR5/{botão 0\\cru}/ledon,
+      LEDR4/{jogada feita\\(pulso)}/ledoff,
+      LEDR3/{link serial\\ok}/ledon,
+      LEDR2/{fim do chart\\(pulso)}/ledoff,
+      LEDR1/{fim da\\contagem}/ledon,
+      LEDR0/{START\\(pulso)}/ledoff} {
+    \node[\est] at (0.4+\i*\L, -1.3) {};
+    \node[tit] at (0.4+\i*\L, -0.95) {\nome};
+    \node[rot, anchor=north] at (0.4+\i*\L, -1.55) {\txt};
+  }
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+\item \textbf{LEDR9..5} mostram o pino cru, antes do debounce: \textbf{aceso = solto},
+  apagado = apertado. É o primeiro teste da montagem: cada botão apaga só o seu LED.
+  Se um LED pisca ou fica apagado sem toque, falta o pull-up ou o fio está no pino errado.
+\item \textbf{LEDR4, 2 e 0} são pulsos de 1 ciclo (20\,ns): na prática não se veem.
+
+\item \textbf{LEDR3} acende quando o PC está recebendo os pacotes e devolvendo ACK
+  (apaga 1\,s depois do último). Apagado com o jogo aberto no PC: pinos 1/2 invertidos
+  no CP2102, fio do pino 2 solto, GND solto ou porta serial errada no Python.
+\item \textbf{LEDR1} acende ao fim da contagem regressiva e fica aceso em PLAY e PAUSE;
+  apaga ao voltar para IDLE/SELECT.
+\item \textbf{HEX1} guarda \s{botoes[3:0]} no instante da jogada (bit 1 = solto) e zera em
+  IDLE/SELECT. Como a jogada conta ao soltar, o normal é ver F; um bit em 0 indica
+  botão ainda apertado naquele instante.
+\end{itemize}
+
+\begin{tabularx}{\linewidth}{@{}c l Y Y@{}}
+\toprule
+HEX0 & Estado & O que acontece & Sai com \\
+\midrule
+0 & IDLE      & tela inicial                                & START $\to$ 6 \\
+6 & SELECT    & escolha da música (Btn0/1/2)                & botão 0..3 $\to$ 1 · START $\to$ 0 \\
+1 & COUNTDOWN & contagem 3, 2, 1 (180 quadros = 3\,s)        & fim da contagem $\to$ 2 \\
+2 & PLAY      & jogo rodando; trilhas 0..3 nos botões 0..3   & START $\to$ 3 · fim do chart $\to$ 4 \\
+3 & PAUSE     & jogo parado                                 & START $\to$ 2 · botão 0..3 $\to$ 0 \\
+4 & END\_WIN  & música terminou                             & START $\to$ 0 \\
+5 & END\_LOSE & não ocorre (\s{perdeu} = 0, sem limite de erros) & START $\to$ 0 \\
+\bottomrule
+\end{tabularx}
+
+\textbf{Reset} (pino 16) leva a 0 a partir de qualquer estado.
+
+\end{document}

@@ -186,6 +186,12 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
 - `SerialReader` (Python) guarda `self._stop` como `Event`, o que sobrescreve `Thread._stop`:
   `join()` quebra com TypeError. O jogo não chama `join`, então não aparece em uso.
 
+- **Serial muda (0 bytes) com a FPGA gravada = olhar primeiro o pino `reset`** (verificado em 03/11/2026).
+  `reset_i = ~reset` e o `.qsf` não liga pull-up interno: com o pino 16 do JP1 (T22) solto, ele oscila,
+  zera o `u_frame_counter` e o `frame_tick` nunca sai, logo nenhum pacote é enviado. O caminho pino 1 → RXD
+  estava bom. Medido: sem pull-up, `reset`=0 em 125 de 143 leituras; com `WEAK_PULL_UP_RESISTOR` em
+  `reset`, 192 de 192 em 1 e 60 pacotes/s. Sintoma na placa: HEX0 preso em 0 e LEDR3 apagado.
+
 ## Gravação (Quartus e fluxo aberto)
 
 - Quartus Prime Lite 25.1 instalado em `~/intelFPGA_lite/25.1std` (só Quartus + Cyclone V, sem

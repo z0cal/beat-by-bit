@@ -6,7 +6,7 @@ Nenhuma logica de jogo aqui — tudo roda na FPGA (Verilog).
 Protocolo UART (115200 baud, 8N1):
   Pacote de 22 bytes a ~60fps:
     [0]  0x55              marcador de inicio
-    [1]  state             0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE
+    [1]  state             0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE 4=WIN 5=LOSE 6=SONG_SELECT
     [2]  countdown_sec     3,2,1,0
     [3-5]  trilha 0 — ages das 3 notas (0xFF = vazio)
     [6-8]  trilha 1
@@ -16,18 +16,21 @@ Protocolo UART (115200 baud, 8N1):
     [16] score low byte
     [17] misses (0-10)
     [18] combo
-    [19] frame_counter[13:8]  (6 bits altos)
+    [19] {song_id[1:0], frame_counter[13:8]}  (2 bits de musica + 6 bits altos)
     [20] frame_counter[7:0]   (8 bits baixos)
     [21] 0xAA              marcador de fim
 
-Conversao age -> Y: y = age * NOTE_SPEED  (NOTE_SPEED=4)
+  Retorno (PC -> FPGA): 1 byte ACK (0xA5) a cada ACK_INTERVAL s enquanto
+  chegam pacotes validos. A FPGA acende LEDR3 enquanto recebe ACKs.
+
+Conversao age -> Y: y = age * NOTE_SPEED  (age=HIT_AGE=130 cai exatamente em HIT_Y)
 """
 
 import pygame
 
 # Tamanho do buffer de audio.
 # Maior buffer = menos crackling em maquinas lentas, mas mais latencia.
-# 16384 @ 44100Hz ≈ 371ms ≈ 22 frames a 60fps — compensado no chart (AUDIO_LATENCY_FRAMES).
+# 4096 @ 44100Hz ≈ 93ms ≈ 6 frames a 60fps — compensado no chart (AUDIO_LATENCY_FRAMES).
 _AUDIO_BUFFER = 4096
 
 # pre_init DEVE ser chamado antes de pygame.init() para garantir as configuracoes
@@ -36,6 +39,7 @@ pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=_AUDIO_BUFFE
 pygame.init()
 
 import threading
+import time
 import queue
 import argparse
 import math
@@ -56,7 +60,7 @@ SCREEN_W, SCREEN_H = 1800, 1080
 FPS = 60
 # Latencia do buffer de audio em frames: compensa o atraso entre pygame.music.play()
 # e o som efetivamente sair pelos alto-falantes.
-AUDIO_LATENCY_FRAMES = round(_AUDIO_BUFFER / 44100 * FPS)  # ≈ 22 frames
+AUDIO_LATENCY_FRAMES = round(_AUDIO_BUFFER / 44100 * FPS)  # ≈ 6 frames
 
 # ─── Fatores de escala (base = 800×600) ──────────────────────────────────────
 _BASE_W, _BASE_H = 800, 600
@@ -77,9 +81,21 @@ def _ps(v):
     return int(v * SS)  # escala uniforme
 
 
-NOTE_SPEED = 4 * SY  # escala com SY para manter HIT_AGE constante
+def _scale_pixel_art(surf, target_w):
+    """Escala pixel art por multiplo inteiro (nearest-neighbor), mais proximo de target_w."""
+    w, h = surf.get_size()
+    k = max(1, round(target_w / w))
+    return pygame.transform.scale(surf, (w * k, h * k))
+
+
+# Parametros que devem bater com note_track.v (HIT_CENTER/HIT_WINDOW/MISS_AGE)
+HIT_AGE = 130  # age da nota no centro da hit zone
+HIT_WIN = 11  # janela de acerto: ±11 frames
+MISS_AGE = 151  # nota escapa apos este age
 HIT_Y = _py(520)
-HIT_AGE = HIT_Y // NOTE_SPEED  # = 130 independente da resolucao
+# Derivado de HIT_AGE para que age=130 caia exatamente em HIT_Y em qualquer resolucao
+# (antes, 4*SY com divisao inteira em float dava HIT_AGE=129 em 1080p).
+NOTE_SPEED = HIT_Y / HIT_AGE
 NOTE_RADIUS = _ps(22)
 GLOW_SIZE = _ps(120)
 GLOW_CENTER = GLOW_SIZE // 2
@@ -99,7 +115,7 @@ TRACK_BG = (12, 20, 48)
 LINE_COLOR = (30, 55, 110)
 HIT_LINE_COL = (55, 100, 180)
 
-MAX_MISSES = 999
+MAX_MISSES = 10  # derrota ao atingir este numero de erros (igual a 'perdeu' em Verilog)
 
 # Estados da FPGA (devem ser iguais aos estados da UC em Verilog)
 STATE_IDLE = 0
@@ -166,6 +182,8 @@ SONGS = [
 PACKET_SIZE = 22
 PKT_HEADER = 0x55
 PKT_FOOTER = 0xAA
+ACK_BYTE = 0xA5
+ACK_INTERVAL = 0.25  # s; a FPGA apaga o LED apos 1 s sem ACK
 EMPTY_SLOT = 0xFF
 
 
@@ -181,7 +199,8 @@ class SerialReader(threading.Thread):
         self.baudrate = baudrate
         self.buf_lock = threading.Lock()
         self._buf = bytearray()
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
+        self._ack = threading.Event()
         self.connected = False
 
     def run(self):
@@ -194,19 +213,27 @@ class SerialReader(threading.Thread):
         except Exception as e:
             print(f"[Serial] Nao foi possivel abrir {self.port}: {e}")
             return
-        while not self._stop.is_set():
+        last_ack = 0.0
+        while not self._stop_evt.is_set():
             try:
-                waiting = ser.in_waiting
-                if waiting > 0:
-                    data = ser.read(waiting)
+                now = time.monotonic()
+                if self._ack.is_set() and now - last_ack >= ACK_INTERVAL:
+                    self._ack.clear()
+                    ser.write(bytes([ACK_BYTE]))
+                    last_ack = now
+                # read(n>=1) bloqueia ate o timeout (50ms) em vez de girar a CPU em loop
+                data = ser.read(max(1, ser.in_waiting))
+                if data:
                     with self.buf_lock:
                         self._buf.extend(data)
             except Exception as e:
                 print(f"[Serial] Erro: {e}")
                 self.connected = False
                 break
-        if ser.is_open:
+        try:
             ser.close()
+        except Exception:
+            pass
 
     def read_buf(self):
         """Retorna e limpa o buffer acumulado (thread-safe)."""
@@ -215,8 +242,12 @@ class SerialReader(threading.Thread):
             self._buf.clear()
         return data
 
+    def request_ack(self):
+        """Pede um ACK para a FPGA (enviado pela thread serial, no maximo 1 a cada ACK_INTERVAL)."""
+        self._ack.set()
+
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
 
 # ─── Parser de pacote ─────────────────────────────────────────────────────────
@@ -224,12 +255,12 @@ class SerialReader(threading.Thread):
 
 def parse_packet(data, offset):
     """
-    Tenta interpretar um pacote de 20 bytes a partir de 'offset' em 'data'.
+    Tenta interpretar um pacote de PACKET_SIZE bytes a partir de 'offset' em 'data'.
     Retorna um dict com o estado do jogo, ou None se invalido.
     """
     if offset + PACKET_SIZE > len(data):
         return None
-    if data[offset] != PKT_HEADER or data[offset + 21] != PKT_FOOTER:
+    if data[offset] != PKT_HEADER or data[offset + PACKET_SIZE - 1] != PKT_FOOTER:
         return None
 
     state = data[offset + 1] & 0x0F
@@ -240,7 +271,7 @@ def parse_packet(data, offset):
         for s in range(3):
             age = data[offset + 3 + t * 3 + s]
             if age != EMPTY_SLOT:
-                track_notes.append(age * NOTE_SPEED)
+                track_notes.append(round(age * NOTE_SPEED))
         notes.append(track_notes)
     score = (data[offset + 15] << 8) | data[offset + 16]
     misses = data[offset + 17]
@@ -269,7 +300,7 @@ def find_packet(buf):
         pkt = parse_packet(buf, i)
         if pkt is not None:
             return pkt, i + PACKET_SIZE
-    # Nao encontrou pacote completo; descarta tudo exceto os ultimos 19 bytes
+    # Nao encontrou pacote completo; descarta tudo exceto os ultimos PACKET_SIZE-1 bytes
     keep = min(len(buf), PACKET_SIZE - 1)
     return None, max(0, len(buf) - keep)
 
@@ -393,8 +424,8 @@ class SimulationEngine:
     """Replica a FSM e a logica de notas do Verilog para teste sem FPGA."""
 
     HIT_AGE = HIT_AGE  # age quando nota esta em HIT_Y (definido em constantes globais)
-    HIT_WIN = 11  # janela de acerto: ±11 frames
-    MISS_AGE = 151  # nota escapa apos este age
+    HIT_WIN = HIT_WIN  # janela de acerto: ±11 frames
+    MISS_AGE = MISS_AGE  # nota escapa apos este age
     CD_FRAMES = 180  # frames de countdown (3s a 60fps)
     SLOTS = 3  # slots de nota por trilha
     EMPTY = 0xFF
@@ -429,7 +460,9 @@ class SimulationEngine:
             self._check_escapes()
             self._spawn_notes()
             self._process_buttons(btn)
-            if self._chart_frame >= self._rom_depth:
+            if self.misses >= MAX_MISSES:
+                self.state = STATE_LOSE
+            elif self._chart_frame >= self._rom_depth:
                 self.state = STATE_WIN
 
         countdown_sec = (
@@ -437,7 +470,7 @@ class SimulationEngine:
         )
         notes = []
         for track in self._ages:
-            notes.append([age * NOTE_SPEED for age in track if age != self.EMPTY])
+            notes.append([round(age * NOTE_SPEED) for age in track if age != self.EMPTY])
 
         return {
             "state": self.state,
@@ -550,9 +583,6 @@ class SimulationEngine:
             if not hit:
                 self.combo = 0
 
-    def _all_empty(self):
-        return all(age == self.EMPTY for track in self._ages for age in track)
-
 
 # ─── Renderer ─────────────────────────────────────────────────────────────────
 
@@ -589,7 +619,6 @@ class Renderer:
         if sim_mode:
             self.sim = SimulationEngine()
             self.serial = None
-            self._sim_song_ms = int(_WAV_DURATION * 1000)
         else:
             self.serial = SerialReader(port=serial_port, baudrate=baudrate)
             self.serial.start()
@@ -602,20 +631,20 @@ class Renderer:
         self._build_progress_gradient()
         self._build_score_backdrop()
         self._build_ghost_note_surfs()
+        self._build_song_previews()
         self._init_idle_anim()
         self._init_music()
         self._load_logo()
 
     def _load_logo(self):
-        logo_path = os.path.join(_ASSETS_DIR, "images", "beat_by_bit_logo.png")
-        raw = pygame.image.load(logo_path).convert_alpha()
-        logo_w = int(SCREEN_W * 0.38)
-        logo_h = int(raw.get_height() * logo_w / raw.get_width())
-        self._logo = pygame.transform.smoothscale(raw, (logo_w, logo_h))
-        title_size = _ps(90)
-        self._logo_title = pygame.transform.smoothscale(raw, (title_size, title_size))
-        pause_size = int(SCREEN_W * 0.17)
-        self._logo_pause = pygame.transform.smoothscale(raw, (pause_size, pause_size))
+        # Logo/icone da identidade visual (identidade/png/*-1x.png, derivados dos SVGs).
+        # Sao pixel art: escala por multiplo inteiro (sem suavizacao) para manter os pixels nitidos.
+        img_dir = os.path.join(_ASSETS_DIR, "images")
+        logo = pygame.image.load(os.path.join(img_dir, "logo-escuro-1x.png")).convert_alpha()
+        icon = pygame.image.load(os.path.join(img_dir, "icone-1x.png")).convert_alpha()
+        self._logo = _scale_pixel_art(logo, int(SCREEN_W * 0.30))
+        self._logo_select = _scale_pixel_art(icon, _ps(50))
+        self._logo_pause = _scale_pixel_art(logo, int(SCREEN_W * 0.14))
 
     # ── Musica ────────────────────────────────────────────────────────────────
 
@@ -623,6 +652,7 @@ class Renderer:
         """Carrega a musica da song selecionada."""
         self._music_ok = False
         self._music_paused = False
+        self._music_started = False  # evita reiniciar a musica quando ela termina antes do WIN
 
         path = SONGS[self._selected_song]["audio"]
 
@@ -634,11 +664,6 @@ class Renderer:
         except Exception as e:
             print(f"[music] Falha ao carregar musica: {e}")
 
-    @staticmethod
-    def _generate_wav(path):
-        """Fallback de sintese para modo FPGA (sem audio externo). Usa mesma sintese do modo sim."""
-        _score_to_wav(path)
-
     def _update_music(self, state):
         """Controla reproducao com base no estado do jogo."""
         if not self._music_ok:
@@ -649,16 +674,19 @@ class Renderer:
                 if self._music_paused:
                     pygame.mixer.music.unpause()  # retoma de onde parou
                     self._music_paused = False
-                else:
+                elif not self._music_started:
                     pygame.mixer.music.play()  # inicia do zero
+                    self._music_started = True
         elif state == STATE_PAUSE:
             if playing:
                 pygame.mixer.music.pause()
                 self._music_paused = True
+                self._music_started = True
         else:  # IDLE, SELECT, COUNTDOWN, WIN, LOSE
             if playing:
                 pygame.mixer.music.stop()
             self._music_paused = False
+            self._music_started = False
 
     # ── Pre-renderizacao ──────────────────────────────────────────────────────
 
@@ -688,13 +716,12 @@ class Renderer:
             pygame.draw.circle(off, (20, 20, 30, 200), (center, center), btn_radius - 1)
             self.btn_off.append(off)
 
-            # ON: estilo arcade aceso (brilho + preenchido + reflexo plastico)
+            # ON: estilo arcade aceso (brilho + preenchido)
             on = pygame.Surface((size, size), pygame.SRCALPHA)
             pygame.draw.circle(on, (*color, 100), (center, center), btn_radius + 8)
             pygame.draw.circle(on, (*color, 200), (center, center), btn_radius + 4)
             pygame.draw.circle(on, color, (center, center), btn_radius)
             pygame.draw.circle(on, (255, 255, 255), (center, center), btn_radius, 2)
-            pygame.draw.ellipse(on, (255, 255, 255, 120), (center - btn_radius // 2, center - btn_radius + 4, btn_radius, btn_radius // 2))
             self.btn_on.append(on)
 
     def _build_scanline_surf(self):
@@ -857,6 +884,7 @@ class Renderer:
             self._serial_buf = self._serial_buf[consumed:]
             if pkt is None:
                 break
+            self.serial.request_ack()
             self._prev_notes = [list(t) for t in self.fpga_notes]
             self._prev_score = self.fpga_score
             self._prev_combo = self.fpga_combo
@@ -879,15 +907,22 @@ class Renderer:
         scored = (
             self.fpga_score > self._prev_score or self.fpga_combo > self._prev_combo
         )
+        if not scored:
+            return
+        hit_tol = (HIT_WIN + 1) * NOTE_SPEED
         for i in range(4):
-            prev_set = set(self._prev_notes[i])
-            curr_set = set(self.fpga_notes[i])
-            for y in prev_set - curr_set:
-                if abs(y - HIT_Y) <= 60 and scored:
-                    # Nota sumiu perto da hit zone E score/combo subiu → acerto
+            # Toda nota anda a cada frame, entao comparar valores de Y exatos marcaria
+            # todas como "sumidas". Casa cada nota anterior (da mais velha para a mais
+            # nova) com uma nota atual que esteja na mesma posicao ou mais adiante;
+            # a que ficar sem par foi removida.
+            curr = sorted(self.fpga_notes[i], reverse=True)
+            for y in sorted(self._prev_notes[i], reverse=True):
+                match = next((c for c in curr if c >= y), None)
+                if match is not None:
+                    curr.remove(match)
+                elif abs(y - HIT_Y) <= hit_tol:
+                    # Nota sumiu na janela de acerto E score/combo subiu → acerto
                     self._spawn_hit_effect(i, TRACK_X[i], HIT_Y)
-                elif y > HIT_Y + 60:
-                    pass  # erro: feedback apenas no HUD (contador + combo)
 
     def _process_sim(self, events):
         """Atualiza o estado a partir da simulacao Python (modo --sim)."""
@@ -1155,7 +1190,7 @@ class Renderer:
         ticks = pygame.time.get_ticks()
         float_y = 6 * math.sin(ticks * 0.002)
 
-        logo_rect = self._logo.get_rect(center=(SCREEN_W // 2, _py(210) + int(float_y)))
+        logo_rect = self._logo.get_rect(center=(SCREEN_W // 2, _py(190) + int(float_y)))
         self.screen.blit(self._logo, logo_rect)
 
         if ticks % 1000 < 650:
@@ -1186,100 +1221,145 @@ class Renderer:
             lines.append(current)
         return lines
 
+    def _build_song_previews(self):
+        """Le os .hex de cada musica e resume a densidade de notas em barras (mini-preview do chart)."""
+        bins_n = 36
+        self._song_previews = []
+        for song in SONGS:
+            preview = {"bins": [0] * bins_n, "notes": 0}
+            try:
+                with open(song["hex"], encoding="ascii") as fh:
+                    rom = [int(line, 16) for line in fh if line.strip()]
+                per_bin = max(1, len(rom) / bins_n)
+                for f, v in enumerate(rom):
+                    if v:
+                        preview["bins"][min(bins_n - 1, int(f / per_bin))] += bin(v).count("1")
+                        preview["notes"] += bin(v).count("1")
+            except (OSError, ValueError):
+                preview = None
+            self._song_previews.append(preview)
+
+    def _draw_song_card(self, i, song, rect, now):
+        """Desenha um card de musica: botao da trilha, titulo, preview do chart e estatisticas."""
+        color = TRACK_COLORS[i]
+        avail = song["available"]
+        cx = rect.centerx
+
+        # Painel (fundo escuro + tonalidade da cor da trilha)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(panel, (*TRACK_BG, 235), panel.get_rect(), border_radius=_ps(10))
+        if avail:
+            pulse = 0.5 + 0.5 * math.sin(now * 0.004 + i * 0.9)
+            pygame.draw.rect(panel, (*color, int(14 + 14 * pulse)), panel.get_rect(), border_radius=_ps(10))
+        self.screen.blit(panel, rect.topleft)
+
+        # Faixa colorida no topo + borda (brilho pulsante nos disponiveis)
+        border_col = color if avail else (50, 50, 80)
+        if avail:
+            glow = pygame.Surface((rect.w + 24, rect.h + 24), pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*color, int(18 + 30 * pulse)), glow.get_rect(), 6, border_radius=_ps(14))
+            self.screen.blit(glow, (rect.x - 12, rect.y - 12))
+        pygame.draw.rect(self.screen, border_col, rect, 2, border_radius=_ps(10))
+        strip = pygame.Rect(rect.x + _ps(10), rect.y, rect.w - 2 * _ps(10), _ps(5))
+        pygame.draw.rect(self.screen, border_col, strip, border_radius=_ps(3))
+
+        # Botao arcade da trilha com a tecla
+        btn = self.btn_on[i] if avail else self.btn_off[i]
+        by = rect.y + _py(44)
+        self.screen.blit(btn, btn.get_rect(center=(cx, by)))
+        key_s = self.font(40).render(TRACK_LABELS[i], True, BG_COLOR if avail else (90, 90, 120))
+        self.screen.blit(key_s, key_s.get_rect(center=(cx, by + 2)))
+
+        sep_y = rect.y + _py(82)
+        pygame.draw.line(self.screen, border_col, (rect.x + _px(14), sep_y), (rect.right - _px(14), sep_y), 1)
+
+        if not avail:
+            em = self.font(22).render("EM BREVE", True, (60, 80, 130))
+            self.screen.blit(em, em.get_rect(center=rect.center))
+            return
+
+        # Titulo e subtitulo
+        text_w = rect.w - _px(16)
+        y = sep_y + _py(18)
+        for line in self._wrap_text(song["title"], 24, text_w):
+            ls = self.font(24).render(line, True, (240, 245, 255))
+            self.screen.blit(ls, ls.get_rect(center=(cx, y)))
+            y += _py(18)
+        y += _py(4)
+        for line in self._wrap_text(song["subtitle"], 17, text_w):
+            ls = self.font(17).render(line, True, (130, 175, 225))
+            self.screen.blit(ls, ls.get_rect(center=(cx, y)))
+            y += _py(14)
+        if song.get("author"):
+            au = self.font(15).render(song["author"], True, (90, 140, 200))
+            self.screen.blit(au, au.get_rect(center=(cx, y + _py(4))))
+
+        # Mini-preview do chart (densidade de notas ao longo da musica)
+        bh = _py(90)
+        bw = rect.w - 2 * _px(14)
+        bx = rect.x + _px(14)
+        bottom = rect.bottom - _py(34)
+        pygame.draw.line(self.screen, LINE_COLOR, (bx, bottom), (bx + bw, bottom), 1)
+        preview = self._song_previews[i] if i < len(self._song_previews) else None
+        if preview and preview["notes"]:
+            bins = preview["bins"]
+            peak = max(bins)
+            slot = bw / len(bins)
+            for k, v in enumerate(bins):
+                h = max(2, int(bh * v / peak)) if v else 1
+                bar = pygame.Rect(int(bx + k * slot) + 1, bottom - h, max(1, int(slot) - 2), h)
+                pygame.draw.rect(self.screen, color if v else LINE_COLOR, bar)
+            notes_txt = f"{preview['notes']} notas"
+        else:
+            notes_txt = ""
+
+        # Estatisticas: duracao e numero de notas
+        mins, secs = divmod(int(round(song["duration"])), 60)
+        stat_y = rect.bottom - _py(17)
+        dur = self.font(17).render(f"{mins}:{secs:02d}", True, (150, 190, 235))
+        self.screen.blit(dur, dur.get_rect(midleft=(bx, stat_y)))
+        if notes_txt:
+            nt = self.font(17).render(notes_txt, True, (150, 190, 235))
+            self.screen.blit(nt, nt.get_rect(midright=(bx + bw, stat_y)))
+
     def _draw_song_select(self):
-        """Tela de selecao de musica: 4 caixas alinhadas com as trilhas."""
+        """Tela de selecao de musica: 4 cards alinhados com as cores das trilhas."""
         self.screen.fill(BG_COLOR)
         self._draw_bg_grid()
         self._draw_tracks(alpha=18)
         self.screen.blit(self.scanline_surf, (0, 0))
 
         now = pygame.time.get_ticks()
+        cx = SCREEN_W // 2
 
-        # Logo centralizado no topo
-        logo_rect = self._logo_title.get_rect(center=(SCREEN_W // 2, _py(55)))
-        self.screen.blit(self._logo_title, logo_rect)
+        # Cabecalho: icone, titulo e sublinhado laranja
+        self.screen.blit(self._logo_select, self._logo_select.get_rect(center=(cx, _py(62))))
+        title = self.font(56).render("SELECIONAR MUSICA", True, (190, 225, 255))
+        shadow = self.font(56).render("SELECIONAR MUSICA", True, (10, 20, 55))
+        ty = _py(118)
+        self.screen.blit(shadow, shadow.get_rect(center=(cx + 3, ty + 3)))
+        self.screen.blit(title, title.get_rect(center=(cx, ty)))
+        pygame.draw.line(
+            self.screen, (255, 110, 0), (cx - _px(60), _py(140)), (cx + _px(60), _py(140)), 3
+        )
 
-        # Titulo abaixo do logo
-        title = self.font(52).render("SELECIONAR MUSICA", True, (180, 220, 255))
-        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, _py(120))))
-
-        BOX_W, BOX_H = _px(118), _py(230)
-        BOX_TOP = _py(155)
-
-        # Caixas com espaçamento uniforme, centradas na tela
-        gap = _px(25)
-        total_w = 4 * BOX_W + 3 * gap
-        x_start = (SCREEN_W - total_w) // 2
-        song_cx = [x_start + BOX_W // 2 + i * (BOX_W + gap) for i in range(4)]
-
+        # Cards centralizados
+        box_w, box_h = _px(130), _py(300)
+        box_top = _py(165)
+        gap = _px(20)
+        x_start = (SCREEN_W - (4 * box_w + 3 * gap)) // 2
         for i, song in enumerate(SONGS):
-            cx = song_cx[i]
-            color = TRACK_COLORS[i]
-            avail = song["available"]
-
-            box_rect = pygame.Rect(cx - BOX_W // 2, BOX_TOP, BOX_W, BOX_H)
-
-            # Fundo
-            bg_alpha = 60 if avail else 20
-            bg = pygame.Surface((BOX_W, BOX_H), pygame.SRCALPHA)
-            bg.fill((*color, bg_alpha))
-            self.screen.blit(bg, box_rect.topleft)
-
-            # Pulso na caixa disponivel
-            if avail:
-                pulse = abs((now % 1200) - 600) / 600.0
-                glow_a = int(25 + 35 * pulse)
-                glow_s = pygame.Surface((BOX_W, BOX_H), pygame.SRCALPHA)
-                glow_s.fill((*color, glow_a))
-                self.screen.blit(glow_s, box_rect.topleft)
-
-            # Borda
-            border_col = color if avail else (50, 50, 80)
-            pygame.draw.rect(
-                self.screen, border_col, box_rect, 2 if avail else 1, border_radius=5
-            )
-
-            # Tecla
-            key_col = color if avail else (70, 70, 100)
-            key_s = self.font(40).render(TRACK_LABELS[i], True, key_col)
-            self.screen.blit(key_s, key_s.get_rect(center=(cx, BOX_TOP + _py(26))))
-
-            # Separador
-            pygame.draw.line(
-                self.screen,
-                (*border_col, 100),
-                (cx - BOX_W // 2 + _px(10), BOX_TOP + _py(46)),
-                (cx + BOX_W // 2 - _px(10), BOX_TOP + _py(46)),
-                1,
-            )
-
-            if avail:
-                y_off = BOX_TOP + _py(58)
-                for line in self._wrap_text(song["title"], 18, BOX_W - _px(8)):
-                    ls = self.font(18).render(line, True, (235, 240, 255))
-                    self.screen.blit(ls, ls.get_rect(center=(cx, y_off)))
-                    y_off += _py(20)
-                y_off += _py(4)
-                for line in self._wrap_text(song["subtitle"], 15, BOX_W - _px(8)):
-                    ls = self.font(15).render(line, True, (130, 175, 225))
-                    self.screen.blit(ls, ls.get_rect(center=(cx, y_off)))
-                    y_off += _py(17)
-                if song.get("author"):
-                    au = self.font(14).render(song["author"], True, (90, 140, 200))
-                    self.screen.blit(au, au.get_rect(center=(cx, y_off + _py(4))))
-            else:
-                em = self.font(17).render("EM BREVE", True, (60, 80, 130))
-                self.screen.blit(em, em.get_rect(center=(cx, BOX_TOP + BOX_H // 2)))
+            rect = pygame.Rect(x_start + i * (box_w + gap), box_top, box_w, box_h)
+            self._draw_song_card(i, song, rect, now)
 
         # Dica
         if self._sim_mode:
             hint_text = "[SIM]  D = Hobbit  |  F = Ocarina  |  J = Power Rangers  |  K = Pokemon  |  SPACE = Voltar"
         else:
-            hint_text = ""
-        hint = self.font(26).render(hint_text, True, (55, 90, 150))
-        self.screen.blit(
-            hint, hint.get_rect(center=(SCREEN_W // 2, BOX_TOP + BOX_H + 28))
-        )
+            hint_text = "Aperte o botao da cor da musica para comecar"
+        if now % 1400 < 1000 or self._sim_mode:
+            hint = self.font(28).render(hint_text, True, (90, 135, 200))
+            self.screen.blit(hint, hint.get_rect(center=(cx, box_top + box_h + _py(30))))
 
     def _draw_countdown(self, sec):
         self.screen.fill(BG_COLOR)

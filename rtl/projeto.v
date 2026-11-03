@@ -12,14 +12,16 @@
  *   porcentagem (TAXA_HEX), sem zeros a esquerda. Ex.: 100, 87, 5.
  *
  * Serial (8N1): BAUD define a velocidade de TX (pacotes) e RX (ACK).
- *   O PC usa o mesmo valor (--baud, padrao 1000000). Para voltar a
- *   115200, troque BAUD aqui e rode o PC com --baud 115200.
+ *   O PC usa o mesmo valor (--baud, padrao 921600). 921600 e o maximo
+ *   da tabela padrao do CP2102 original: pedir 1000000 cai em ~921600
+ *   no conversor e corrompe todos os bytes. Para voltar a 115200,
+ *   troque BAUD aqui e rode o PC com --baud 115200.
  *-----------------------------------------------------------------------
  */
 
 module beat_by_bit #(
     parameter CLK_HZ = 50_000_000,
-    parameter BAUD   = 1_000_000     // 50 MHz / 1 Mbaud = 50 ciclos/bit (exato)
+    parameter BAUD   = 921_600       // 50 MHz / 921600 = 54 ciclos/bit (925926 baud, +0,5%)
 ) (
     input  wire        clock,
     input  wire        reset,

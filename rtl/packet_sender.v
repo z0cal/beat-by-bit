@@ -4,8 +4,8 @@
  *-----------------------------------------------------------------------
  * Descricao : Monta e envia um pacote de 49 bytes via UART a cada
  *             frame_tick. Aguarda o uart_tx ficar pronto entre bytes.
- *             49 bytes levam ~0,5 ms a 1 Mbaud (~4,3 ms a 115200); o
- *             quadro tem 16,7 ms.
+ *             49 bytes levam ~0,53 ms a 921600 baud (~4,3 ms a 115200);
+ *             o quadro tem 16,7 ms.
  *
  * Formato do pacote (49 bytes, valores multibyte em big-endian):
  *   [0]    0x55          marcador de inicio
@@ -46,7 +46,7 @@
  */
 
 module packet_sender #(
-    parameter CLKS_PER_BIT = 50      // 50 MHz / 1 Mbaud (o top passa o valor); o TB encurta
+    parameter CLKS_PER_BIT = 54      // 50 MHz / 921600 (o top passa o valor); o TB encurta
 ) (
     input  wire        clock,
     input  wire        reset,

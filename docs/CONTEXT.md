@@ -9,7 +9,7 @@ Layout: `rtl/` (Verilog + Quartus + charts `.hex`), `tb/` (testbenches), `pc/` (
 ## Arquitetura
 
 ```
-FPGA (Verilog) ──UART 1 Mbaud───► Python (Pygame)
+FPGA (Verilog) ──UART 921600───► Python (Pygame)
   projeto.v           (49 bytes/frame)    interface.py
   unidade_controle.v                      SimulationEngine (--sim)
   fluxo_dados.v
@@ -144,11 +144,14 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 
 ## Protocolo UART (FPGA → Python)
 
-Pacote de 49 bytes a 60fps, 1 Mbaud 8N1 (~0,5 ms de transmissão por quadro de 16,7 ms).
-A velocidade é o parâmetro `BAUD` do `projeto.v` (50 MHz / 1 Mbaud = 50 ciclos/bit, exato) e o
-`--baud` do PC (padrão 1000000); os dois precisam bater. Para voltar a 115200: `BAUD = 115_200`
-e `--baud 115200`. O adaptador é um CP2102 (até 1 Mbps no datasheet). A folga sobra para os
-dados do sensor e do servo-metrônomo.
+Pacote de 49 bytes a 60fps, 921600 baud 8N1 (~0,53 ms de transmissão por quadro de 16,7 ms).
+A velocidade é o parâmetro `BAUD` do `projeto.v` (50 MHz / 921600 = 54 ciclos/bit → 925926 baud,
++0,5%) e o `--baud` do PC (padrão 921600); os dois precisam bater. Para voltar a 115200:
+`BAUD = 115_200` e `--baud 115200`. **Não usar 1 Mbaud**: o CP2102 original só tem até 921600 na
+tabela padrão, então o pedido de 1000000 vira ~921600 no conversor (8% de erro) e nenhum pacote
+chega inteiro (a tela fica parada na tela inicial e o LEDR3 apagado). A folga sobra para os
+dados do sensor e do servo-metrônomo. Diagnóstico na bancada: `uv run
+pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados vistos).
 ```
 [0]  = 0x55 (header)
 [1]  = {eq[3:0], state}: state nos 4 bits baixos (0=idle,1=countdown,2=play,3=pause,
@@ -179,7 +182,7 @@ dados do sensor e do servo-metrônomo.
 
 ```bash
 uv run pc/interface.py --sim          # modo simulação (sem FPGA)
-uv run --extra fpga pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
+uv run pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
 python pc/interface.py --port COM3    # modo FPGA (Windows)
 python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 ```
@@ -221,7 +224,7 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note_track` reais),
 `tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (49 bytes),
 `tb_nome_perfil.v`, `tb_nome_top.v` (nome com os botões reais pelo debounce),
-`tb_baud_top.v` (top a 1 Mbaud: pacote no pino TX, ACK no RX com ±2% de erro de baud),
+`tb_baud_top.v` (top a 921600: pacote no pino TX, ACK no RX a 921600, 923077 e ±2%),
 `tb_note_track.v`, `tb_fd.v`, `tb_uc_*.v`, etc. `tb_countdown_transition.v` falha desde antes
 (segura o reset ativo e referencia um `u_game_timer` que não existe).
 

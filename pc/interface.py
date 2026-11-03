@@ -3,7 +3,7 @@ Beat by Bit - Semestre 2
 Renderer puro: recebe pacotes da FPGA via UART e renderiza o jogo.
 Nenhuma logica de jogo aqui — tudo roda na FPGA (Verilog).
 
-Protocolo UART (1 Mbaud, 8N1; --baud muda):
+Protocolo UART (921600 baud, 8N1; --baud muda):
   Pacote de 49 bytes a ~60fps (multibyte em big-endian):
     [0]  0x55              marcador de inicio
     [1]  {eq_lo, state}    state (bits 3:0): 0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE
@@ -307,7 +307,7 @@ def _eq_wav_bytes(path, eq, preview_s=None):
 class SerialReader(threading.Thread):
     """Le bytes da UART em background e coloca em buffer thread-safe."""
 
-    def __init__(self, port="/dev/ttyUSB0", baudrate=1_000_000):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=921_600):
         super().__init__(daemon=True)
         self.port = port
         self.baudrate = baudrate
@@ -1084,7 +1084,7 @@ class Renderer:
     def __init__(
         self,
         serial_port="/dev/ttyUSB0",
-        baudrate=1_000_000,
+        baudrate=921_600,
         sim_mode=False,
         scale=None,
         audio_offset_ms=0,
@@ -2538,8 +2538,8 @@ if __name__ == "__main__":
         help="Porta serial da FPGA (padrao: /dev/ttyUSB0)",
     )
     parser.add_argument(
-        "--baud", type=int, default=1_000_000,
-        help="Baudrate UART (padrao: 1000000; igual ao parametro BAUD do projeto.v)"
+        "--baud", type=int, default=921_600,
+        help="Baudrate UART (padrao: 921600; igual ao parametro BAUD do projeto.v)"
     )
     parser.add_argument(
         "--sim",

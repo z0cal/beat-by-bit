@@ -114,3 +114,5 @@ set_location_assignment PIN_N16 -to uart_tx_out
 set_location_assignment PIN_B16 -to uart_rx_in
 
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
+# Pino solto oscila e mantem o jogo em reset (nenhum pacote UART sai).
+set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to reset

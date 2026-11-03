@@ -44,6 +44,14 @@ tb*.out
 
 # Evidencias geradas por teste
 
+# Python/uv: ambiente local de cada integrante. O uv.lock muda a cada
+# `uv add`/`uv sync` e gera conflito no pull; o pyproject.toml ja fixa as
+# dependencias e a versao do Python (requires-python).
+uv.lock
+.python-version
+.ruff_cache/
+.mypy_cache/
+
 # Ambientes virtuais Python
 venv/
 env/
@@ -57,6 +65,21 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Quartus: arquivos gerados alem dos ja listados acima (so .qpf e .qsf vao
+# para o git)
+*.sof
+*.pof
+*.jdi
+*.sld
+*.pin
+*.done
+*.cdf
+*.qdf
+*.qar
+
+# Editores e ferramentas locais
+.claude/settings.local.json
 
 # Workflow hdl/fpga-new (make check, make yosys)
 .sim/

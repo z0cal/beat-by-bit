@@ -140,3 +140,64 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `contador_m.v` | Contador parametrizável |
 
 Testbenches (`tb/`): `tb_fd.v`, `tb_uc_ganha.v`, `tb_uc_perde.v`, `tb_countdown_transition.v`, etc.
+
+---
+
+## Hardware e pinagem (DE0-CV)
+
+Cola de montagem com desenho do conector: `docs/cola/cola_beat_by_bit.pdf` (fonte `.tex` ao lado).
+
+Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0..9], 11 = 5 V,
+12 = GND, 13-28 = GPIO[10..25], 29 = 3,3 V, 30 = GND, 31-40 = GPIO[26..35].
+
+| Sinal | Pino JP1 | Pino FPGA | Liga em |
+|-------|----------|-----------|---------|
+| `uart_tx_out` | 1 | N16 | RXD do CP2102 (GND do CP2102 no pino 12) |
+| `uart_rx_in` | 2 | B16 | TXD do CP2102 (ACK do PC) |
+| `reset` | 16 | T22 | botão → GND + pull-up 10 kΩ (apertado = reset) |
+| `botoes[4]` START/PAUSE | 36 | T20 | botão → GND + pull-up 10 kΩ |
+| `botoes[1]` | 37 | T19 | idem |
+| `botoes[3]` | 38 | T18 | idem |
+| `botoes[0]` | 39 | T17 | idem |
+| `botoes[2]` | 40 | T15 | idem |
+| 3,3 V / GND | 29 / 30 | — | trilhos + / − dos pull-ups e botões |
+
+- Pull-ups são **externos** (o `.qsf` não liga o pull-up interno): solto = 1, apertado = 0.
+- `clock` = CLOCK_50 (M9). `HEX0` = estado da FSM, `HEX1` = `botoes[3:0]` registrados na jogada.
+- LEDR0..4 = `leds_pulsos` = {start, fim_contagem, fim_tempo, link_ok, jogada_feita} na ordem
+  LEDR0 = start ... LEDR4 = jogada_feita. LEDR5..9 = `botoes[0..4]` crus (aceso = solto).
+- **LEDR3 = link serial ok** (`uart_link.v`): o Python manda `0xA5` a cada 0,25 s enquanto recebe
+  pacotes válidos; a FPGA (`uart_rx`) mantém o LED aceso até 1 s após o último ACK. Aceso = caminho
+  completo FPGA → RXD → Python → TXD → FPGA ok. Apagado com o jogo rodando = pino 1 no TXD (invertido),
+  falta o fio do pino 2, GND solto ou Python sem a porta aberta.
+
+### Pegadinhas conhecidas (verificado em 27/10/2026)
+
+- **Segmentos dos displays** (corrigido em 27/10/2026): o `.qsf` tinha `db_estado`/`db_jogada`
+  com índices `[6:0]` invertidos. Agora `[0]` = segmento `a` (U21 em HEX0, AA20 em HEX1), que é a
+  ordem do `hexa7seg` (`0 = 7'b1000000`, bit 6 = `g`).
+- **Jogada conta ao soltar**: `debounce_pulse` dispara na subida do sinal; com pull-up, a subida
+  é quando o botão é solto. Lockout de 9 M ciclos (180 ms).
+- **LEDR0, 2, 4 nunca acendem visivelmente** (pulsos de 1 ciclo). `perdeu = 1'b0` (sem limite
+  de erros, então END_LOSE nunca ocorre); por isso LEDR3 foi reaproveitado para o link serial. **LEDR1** fica aceso em
+  PLAY/PAUSE (o contador do countdown para em 179).
+- Na **PAUSE**, qualquer botão 0..3 (`song_ok`) volta para IDLE, não só o botão 0.
+- **`tb_countdown_transition` falha** desde antes de 27/10/2026 (estado fica em 0); as demais passam.
+- `SerialReader` (Python) guarda `self._stop` como `Event`, o que sobrescreve `Thread._stop`:
+  `join()` quebra com TypeError. O jogo não chama `join`, então não aparece em uso.
+
+## Gravação (Quartus e fluxo aberto)
+
+- Quartus Prime Lite 25.1 instalado em `~/intelFPGA_lite/25.1std` (só Quartus + Cyclone V, sem
+  sudo, via `qinst-lite-linux-25.1std-1129.run --cli`). O `Makefile` acha `quartus/bin` sozinho
+  (`QUARTUS_BIN`), sem precisar de PATH. Links antigos `downloads.intel.com/akdlm/...` dão 404 desde a
+  separação Intel/Altera; o site da Altera bloqueia download automático (baixar pelo navegador).
+- `make program`: Quartus (`quartus_map/fit/asm` → `.sof`) + `quartus_pgm`. `make jtag`: `jtagconfig`.
+- `make program-oss`: Yosys (`synth_intel_alm`) → `.yosys/beat_by_bit.json` →
+  `~/.local/bin/nextpnr-mistral` (pinagem lida do `.qsf`) → `.yosys/beat_by_bit.rbf` →
+  `openFPGALoader -c usb-blaster`. Incremental; grava na SRAM (volátil). `make jtag-oss`: detecção.
+- **Suspeita no fluxo aberto (27/10/2026):** com `program-oss`, a UART FPGA→PC não entregou nenhum
+  byte (nem com a FPGA virando um fio pino 2→pino 1), enquanto PC→FPGA (pino 2, LEDR3) funcionou.
+  `uart_tx_out` (N16) é a única saída no lado direito do chip (`IO.54.x`); suspeita de saída
+  nesse banco no Mistral. Por isso `make program` voltou para o Quartus.
+- Logs do fluxo aberto: `.yosys/yosys.log`, `.yosys/nextpnr.log` (`grep "Constraining IO"`).

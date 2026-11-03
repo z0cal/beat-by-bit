@@ -7,6 +7,7 @@
 #   make check     iverilog: compila + roda; o TB precisa verificar os resultados
 #   make check-all roda todas as testbenches de tb/ e resume quais falharam
 #   make yosys     valida sintese Intel ALM (Cyclone V), sem gerar bitstream
+#   make program-oss  yosys + nextpnr-mistral + openFPGALoader (sem Quartus)
 #   make sync      re-varre rtl/ e reescreve a lista de fontes do .qsf
 #   make           sintese incremental ate o .sof
 #   make qar       empacota a entrega da experiencia
@@ -26,15 +27,25 @@ TBS         := $(basename $(notdir $(wildcard tb/*.v tb/*.sv)))
 
 HDL_BIN     ?= $(HOME)/.local/bin
 YOSYS       ?= yosys
-QUARTUS_SH  ?= quartus_sh
-QUARTUS_MAP ?= quartus_map
-QUARTUS_FIT ?= quartus_fit
-QUARTUS_ASM ?= quartus_asm
-QUARTUS_STA ?= quartus_sta
-QUARTUS_PGM ?= quartus_pgm
-QUARTUS_GUI ?= quartus
-JTAGCONFIG  ?= jtagconfig
+# Quartus fora do PATH: usa a instalacao local em ~/intelFPGA_lite, se houver.
+QUARTUS_BIN ?= $(firstword $(wildcard $(HOME)/intelFPGA_lite/*/quartus/bin))
+Q           := $(if $(QUARTUS_BIN),$(QUARTUS_BIN)/)
+QUARTUS_SH  ?= $(Q)quartus_sh
+QUARTUS_MAP ?= $(Q)quartus_map
+QUARTUS_FIT ?= $(Q)quartus_fit
+QUARTUS_ASM ?= $(Q)quartus_asm
+QUARTUS_STA ?= $(Q)quartus_sta
+QUARTUS_PGM ?= $(Q)quartus_pgm
+QUARTUS_GUI ?= $(Q)quartus
+JTAGCONFIG  ?= $(Q)jtagconfig
 CABLE       ?= USB-Blaster
+
+# Fluxo aberto de gravacao: yosys -> nextpnr-mistral -> .rbf -> openFPGALoader.
+NEXTPNR     ?= $(HDL_BIN)/nextpnr-mistral
+OFL         ?= openFPGALoader
+OFL_CABLE   ?= usb-blaster
+DEVICE      := $(shell sed -n 's/^set_global_assignment -name DEVICE  *//p' $(QSF) 2>/dev/null)
+FREQ        ?= 50
 
 MASON_BIN      ?= $(HOME)/.local/share/nvim/mason/bin
 VERIBLE_LINT   ?= $(MASON_BIN)/verible-verilog-lint
@@ -68,8 +79,12 @@ ASM := $(OUT)/$(PROJECT).asm.rpt
 STA := $(OUT)/$(PROJECT).sta.rpt
 SOF := $(OUT)/$(PROJECT).sof
 
+OSS  := .yosys
+JSON := $(OSS)/$(TOP).json
+RBF  := $(OSS)/$(TOP).rbf
+
 .PHONY: all help check check-all waves sync yosys figura-rtl figura-fsm lint format-check \
-        format gui fpga timing jtag program qar pins report clean-sim clean-cache clean-all
+        format gui fpga timing jtag jtag-oss program program-oss qar pins report clean-sim clean-cache clean-all
 .DELETE_ON_ERROR:
 
 all: $(SOF) $(STA)
@@ -91,7 +106,9 @@ help:
 	  'make pins           pinagem efetiva depois do fit' \
 	  'make report         resumo de area e timing' \
 	  'make jtag           lista o USB-Blaster e a cadeia JTAG' \
-	  'make program        grava o .sof na placa' \
+	  'make program        grava o .sof na placa (Quartus)' \
+	  'make jtag-oss       idem, com openFPGALoader' \
+	  'make program-oss    yosys + nextpnr-mistral, grava o .rbf (sem Quartus)' \
 	  'make qar            empacota a entrega ($(QAR))' \
 	  'make clean-sim      remove artefatos de simulacao' \
 	  'make clean-all      remove tudo que e gerado'
@@ -123,10 +140,17 @@ sync:
 
 # Valida as mesmas fontes do Quartus, rodando de $(QUARTUS_DIR) e com a macro
 # QUARTUS do .qsf: os $readmemh resolvem igual. O .sof continua no Quartus.
-yosys: $(SRC) $(QSF)
-	@mkdir -p .yosys
-	@rm -f .yosys/$(TOP).json
-	cd $(QUARTUS_DIR) && $(YOSYS) -Q -T -l ../../.yosys/yosys.log -p "read_verilog -sv -DQUARTUS $(patsubst $(QUARTUS_DIR)/%,%,$(SRC)); synth_intel_alm -family cyclonev -top $(TOP); check -assert; write_json ../../.yosys/$(TOP).json; stat"
+yosys: $(JSON)
+
+$(JSON): $(SRC) $(QSF)
+	@mkdir -p $(OSS)
+	cd $(QUARTUS_DIR) && $(YOSYS) -Q -T -l ../../$(OSS)/yosys.log -p "read_verilog -sv -DQUARTUS $(patsubst $(QUARTUS_DIR)/%,%,$(SRC)); synth_intel_alm -family cyclonev -top $(TOP); check -assert; write_json ../../$(JSON); stat"
+
+# Place & route com a pinagem do .qsf; log completo em $(OSS)/nextpnr.log.
+$(RBF): $(JSON) $(QSF)
+	$(NEXTPNR) --device $(DEVICE) --json $(JSON) --qsf $(QSF) --freq $(FREQ) \
+	  --rbf $(RBF) > $(OSS)/nextpnr.log 2>&1 || { tail -20 $(OSS)/nextpnr.log >&2; exit 1; }
+	@grep 'Max frequency' $(OSS)/nextpnr.log | tail -1
 
 figura-rtl:
 	@mkdir -p $(FIGS)
@@ -184,10 +208,19 @@ report: $(SOF) $(STA)
 jtag:
 	$(JTAGCONFIG)
 
+jtag-oss:
+	$(OFL) -c $(OFL_CABLE) --detect
+
 program: $(SOF)
 	@$(JTAGCONFIG) | grep -q 'USB-Blaster' || \
 	  { printf '%s\n' 'ERRO: USB-Blaster nao encontrado. Ligue a placa e rode make jtag.' >&2; exit 1; }
 	$(QUARTUS_PGM) -c "$(CABLE)" -m jtag -o "p;$(SOF)"
+
+# Fluxo aberto, sem Quartus. Grava na SRAM (volatil).
+program-oss: $(RBF)
+	@$(OFL) -c $(OFL_CABLE) --detect >/dev/null 2>&1 || \
+	  { printf '%s\n' 'ERRO: USB-Blaster nao encontrado. Ligue a placa e rode make jtag-oss.' >&2; exit 1; }
+	$(OFL) -c $(OFL_CABLE) $(RBF)
 
 # Entrega. O arquivador varre a pasta do projeto, entao o .tcl auxiliar e
 # escrito FORA dela para nao entrar no .qar.

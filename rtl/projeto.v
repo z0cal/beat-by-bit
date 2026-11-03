@@ -15,7 +15,8 @@ module beat_by_bit (
     output wire [6:0]  db_jogada,    // HEX1: Ultimo botao pressionado
     output wire [4:0]  leds_pulsos,  // LEDs de debug
     output wire [4:0]  db_botoes_raw,// Debug: botoes crus (LEDR 5-9)
-    output wire        uart_tx_out   // TX serial para o PC (115200 baud)
+    output wire        uart_tx_out,  // TX serial para o PC (115200 baud)
+    input  wire        uart_rx_in    // RX serial: ACK do PC (TXD do CP2102)
 );
 
     // Reset invertido: o pino GPIO tem pull-up (1 quando solto),
@@ -40,8 +41,10 @@ module beat_by_bit (
     wire        s_frame_tick;
     wire [13:0] s_frame_counter;
     wire [1:0]  s_song_id;
+    wire        s_link_ok;
 
-    assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_perdeu, s_jogada_feita};
+    // LEDR3 = link serial ok (PC recebendo pacotes); perdeu e fixo em 0
+    assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_link_ok, s_jogada_feita};
 
     // Debug: sinais crus dos botoes (antes do debounce) nos LEDR 5-9
     assign db_botoes_raw = botoes;
@@ -118,6 +121,16 @@ module beat_by_bit (
         .frame_counter (s_frame_counter),
         .song_id       (s_song_id),
         .uart_tx_out   (uart_tx_out)
+    );
+
+    // ----------------------------------------------------------------
+    // Link serial: acende LEDR3 enquanto o PC devolve ACKs
+    // ----------------------------------------------------------------
+    uart_link u_link (
+        .clock    (clock),
+        .reset    (reset_i),
+        .rx_serial(uart_rx_in),
+        .link_ok  (s_link_ok)
     );
 
     // ----------------------------------------------------------------

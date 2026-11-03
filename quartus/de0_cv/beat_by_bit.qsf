@@ -74,6 +74,8 @@ set_global_assignment -name VERILOG_FILE ../../rtl/note_track.v
 set_global_assignment -name VERILOG_FILE ../../rtl/packet_sender.v
 set_global_assignment -name VERILOG_FILE ../../rtl/projeto.v
 set_global_assignment -name VERILOG_FILE ../../rtl/registrador_4.v
+set_global_assignment -name VERILOG_FILE ../../rtl/uart_link.v
+set_global_assignment -name VERILOG_FILE ../../rtl/uart_rx.v
 set_global_assignment -name VERILOG_FILE ../../rtl/uart_tx.v
 set_global_assignment -name VERILOG_FILE ../../rtl/unidade_controle.v
 # <<< fpga-sync <<<
@@ -83,20 +85,20 @@ set_location_assignment PIN_T15 -to botoes[2]
 set_location_assignment PIN_T19 -to botoes[1]
 set_location_assignment PIN_T17 -to botoes[0]
 set_location_assignment PIN_M9 -to clock
-set_location_assignment PIN_U21 -to db_estado[6]
-set_location_assignment PIN_V21 -to db_estado[5]
-set_location_assignment PIN_W22 -to db_estado[4]
+set_location_assignment PIN_U21 -to db_estado[0]
+set_location_assignment PIN_V21 -to db_estado[1]
+set_location_assignment PIN_W22 -to db_estado[2]
 set_location_assignment PIN_W21 -to db_estado[3]
-set_location_assignment PIN_Y22 -to db_estado[2]
-set_location_assignment PIN_Y21 -to db_estado[1]
-set_location_assignment PIN_AA22 -to db_estado[0]
-set_location_assignment PIN_AA20 -to db_jogada[6]
-set_location_assignment PIN_AB20 -to db_jogada[5]
-set_location_assignment PIN_AA19 -to db_jogada[4]
+set_location_assignment PIN_Y22 -to db_estado[4]
+set_location_assignment PIN_Y21 -to db_estado[5]
+set_location_assignment PIN_AA22 -to db_estado[6]
+set_location_assignment PIN_AA20 -to db_jogada[0]
+set_location_assignment PIN_AB20 -to db_jogada[1]
+set_location_assignment PIN_AA19 -to db_jogada[2]
 set_location_assignment PIN_AA18 -to db_jogada[3]
-set_location_assignment PIN_AB18 -to db_jogada[2]
-set_location_assignment PIN_AA17 -to db_jogada[1]
-set_location_assignment PIN_U22 -to db_jogada[0]
+set_location_assignment PIN_AB18 -to db_jogada[4]
+set_location_assignment PIN_AA17 -to db_jogada[5]
+set_location_assignment PIN_U22 -to db_jogada[6]
 set_location_assignment PIN_AA2 -to leds_pulsos[4]
 set_location_assignment PIN_AA1 -to leds_pulsos[3]
 set_location_assignment PIN_W2 -to leds_pulsos[2]
@@ -109,4 +111,5 @@ set_location_assignment PIN_L2 -to db_botoes_raw[3]
 set_location_assignment PIN_L1 -to db_botoes_raw[4]
 set_location_assignment PIN_T22 -to reset
 set_location_assignment PIN_N16 -to uart_tx_out
+set_location_assignment PIN_B16 -to uart_rx_in
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

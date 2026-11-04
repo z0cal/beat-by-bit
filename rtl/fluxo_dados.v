@@ -20,6 +20,8 @@
  *   - Bloco de metricas da sessao (metricas.v): assincronia de cada
  *     acerto, notas e acertos por trilha e maior combo. Zera em
  *     COUNTDOWN e fica congelado em PAUSE, END e IDLE
+ *   - Nome do perfil em estilo arcade (nome_perfil.v), editado pelos
+ *     botoes de trilha no fim de musica (END_WIN/END_LOSE)
  *-----------------------------------------------------------------------
  * Clock assumido: 50 MHz
  *   frame_tick: M = 833_333 ciclos (= 50MHz / 60fps)
@@ -86,7 +88,11 @@ module fluxo_dados (
     output wire [22:0] met_soma_e2,    // soma de e^2
     output wire [47:0] met_notas,      // notas julgadas, 12 bits por trilha
     output wire [47:0] met_acertos,    // acertos, 12 bits por trilha
-    output wire [7:0]  met_max_combo   // maior combo da sessao
+    output wire [7:0]  met_max_combo,  // maior combo da sessao
+
+    // Nome do perfil: 3 caracteres de 6 bits e cursor (ver nome_perfil.v)
+    output wire [17:0] nome_out,
+    output wire [1:0]  nome_cursor
 );
 
     // ----------------------------------------------------------------
@@ -142,6 +148,19 @@ module fluxo_dados (
         .habilita(db_estado == 4'b0111),
         .pulso   (btn_pulse),
         .eq      (eq_out)
+    );
+
+    // ----------------------------------------------------------------
+    // Nome do perfil: D/F trocam o caractere, J/K movem o cursor, so no
+    // fim de musica (db_estado == 4 ou 5)
+    // ----------------------------------------------------------------
+    nome_perfil u_nome (
+        .clock   (clock),
+        .reset   (reset),
+        .habilita((db_estado == 4'b0100) || (db_estado == 4'b0101)),
+        .pulso   (btn_pulse),
+        .nome    (nome_out),
+        .cursor  (nome_cursor)
     );
 
     // ----------------------------------------------------------------

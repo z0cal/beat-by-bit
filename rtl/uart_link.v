@@ -10,14 +10,14 @@
  *             CP2102 -> Python -> TXD do CP2102 -> FPGA.
  *-----------------------------------------------------------------------
  * Parametros:
- *   CLKS_PER_BIT   : ciclos de clock por bit (434 = 115200 baud @ 50MHz)
+ *   CLKS_PER_BIT   : ciclos de clock por bit (54 = 921600 baud @ 50MHz)
  *   TIMEOUT_CYCLES : ciclos sem ACK ate apagar (50_000_000 = 1 s)
  *   ACK_BYTE       : byte de confirmacao enviado pelo PC
  *-----------------------------------------------------------------------
  */
 
 module uart_link #(
-    parameter CLKS_PER_BIT   = 434,
+    parameter CLKS_PER_BIT   = 54,
     parameter TIMEOUT_CYCLES = 50_000_000,
     parameter ACK_BYTE       = 8'hA5
 ) (

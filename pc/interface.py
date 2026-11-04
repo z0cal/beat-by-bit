@@ -3,8 +3,8 @@ Beat by Bit - Semestre 2
 Renderer puro: recebe pacotes da FPGA via UART e renderiza o jogo.
 Nenhuma logica de jogo aqui — tudo roda na FPGA (Verilog).
 
-Protocolo UART (115200 baud, 8N1):
-  Pacote de 46 bytes a ~60fps (multibyte em big-endian):
+Protocolo UART (921600 baud, 8N1; --baud muda):
+  Pacote de 49 bytes a ~60fps (multibyte em big-endian):
     [0]  0x55              marcador de inicio
     [1]  {eq_lo, state}    state (bits 3:0): 0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE
                            4=WIN 5=LOSE 6=SELECT 7=SETTINGS
@@ -29,7 +29,11 @@ Protocolo UART (115200 baud, 8N1):
     [30-32] soma de e^2
     [33-44] por trilha t, 3 bytes a partir de 33+3t: {notas[t], acertos[t]}
             (12 bits cada; notas = notas julgadas, acerto ou nota perdida)
-    [45] 0xAA              marcador de fim
+    --- nome do perfil (nome_perfil.v), editado no fim de musica ---
+    [45]    {cursor[1:0], c0}  c0 = caractere da esquerda
+    [46]    c1
+    [47]    c2                 caractere: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
+    [48] 0xAA              marcador de fim
 
   Retorno (PC -> FPGA): 1 byte ACK (0xA5) a cada ACK_INTERVAL s enquanto
   chegam pacotes validos. A FPGA acende LEDR3 enquanto recebe ACKs.
@@ -56,7 +60,6 @@ pygame.init()
 
 import csv
 import io
-import re
 import threading
 import time
 from collections import Counter
@@ -188,8 +191,8 @@ SONGS = [
         "ref_notes": 88,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
     {
-        "title": "Power Rangers",
-        "subtitle": "Super Patrulha Delta",
+        "title": "Super Patrulha Delta",
+        "subtitle": "Power Rangers",
         "author": "",
         "midi": os.path.join(_SONGS_DIR, "power_rangers", "power_rangers.mid"),
         "audio": os.path.join(_SONGS_DIR, "power_rangers", "Power_Rangers.wav"),
@@ -201,8 +204,8 @@ SONGS = [
         "ref_notes": 132,  # notas do chart antigo (todos os canais); base do CHART_NOTE_FACTOR
     },
     {
-        "title": "Pokemon",
-        "subtitle": "Opening Theme",
+        "title": "Opening Theme",
+        "subtitle": "Pokemon",
         "author": "",
         "midi": os.path.join(_SONGS_DIR, "pokemon", "opening_pokemon.mid"),
         "audio": os.path.join(_SONGS_DIR, "pokemon", "Pokemon.wav"),
@@ -215,7 +218,7 @@ SONGS = [
     },
 ]
 
-PACKET_SIZE = 46
+PACKET_SIZE = 49
 PKT_HEADER = 0x55
 PKT_FOOTER = 0xAA
 ACK_BYTE = 0xA5
@@ -304,7 +307,7 @@ def _eq_wav_bytes(path, eq, preview_s=None):
 class SerialReader(threading.Thread):
     """Le bytes da UART em background e coloca em buffer thread-safe."""
 
-    def __init__(self, port="/dev/ttyUSB0", baudrate=115200):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=921_600):
         super().__init__(daemon=True)
         self.port = port
         self.baudrate = baudrate
@@ -408,7 +411,23 @@ def parse_packet(data, offset):
         "song_id": song_id,
         "eq": eq,
         "metrics": _parse_metrics(data, offset),
+        "nome": "".join(_name_char(data[offset + 45 + k] & 0x3F) for k in range(3)),
+        "cursor": min(2, data[offset + 45] >> 6),
     }
+
+
+# Nome do perfil em estilo arcade (nome_perfil.v): 3 caracteres, "---" = sem perfil
+NAME_CHARS = "-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+NO_PROFILE = "---"
+
+
+def _name_char(code):
+    return NAME_CHARS[code] if code < len(NAME_CHARS) else "?"
+
+
+def profile_of(name):
+    """Pseudonimo da sessao: o nome de 3 caracteres, ou None para "---"."""
+    return None if name == NO_PROFILE or "?" in name else name
 
 
 def _parse_metrics(data, o):
@@ -499,9 +518,8 @@ def session_summary(m):
     return out
 
 
-# Pseudonimo vira nivel de topico MQTT (Semana 4): so letras, digitos, _ e -
-PSEUDONYM_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 DEFAULT_HISTORY = os.path.join(_ROOT_DIR, "sessoes", "sessoes.csv")
+TOAST_S = 6.0  # s que o aviso "sessao salva" fica na tela inicial
 
 SESSION_FIELDS = (
     ["data_hora", "pseudonimo", "musica", "song_id", "resultado", "score", "erros",
@@ -868,6 +886,9 @@ class SimulationEngine:
         self._eq = [0] * 4
         # Metricas da sessao: como o metricas.v, zeram so no COUNTDOWN
         self._met = empty_metrics()
+        # Nome do perfil: como o nome_perfil.v, so zera no reset ("---")
+        self._nome = [0, 0, 0]
+        self._cursor = 0
         # Pre-gera charts de todas as musicas disponíveis e grava os .hex no disco
         self._charts = [
             _midi_to_chart(s, save_hex=True) for s in SONGS if s["available"]
@@ -914,6 +935,8 @@ class SimulationEngine:
             "metrics": {
                 k: (list(v) if isinstance(v, list) else v) for k, v in self._met.items()
             },
+            "nome": "".join(NAME_CHARS[c] for c in self._nome),
+            "cursor": self._cursor,
         }
 
     # ── FSM ──────────────────────────────────────────────────────────────────
@@ -964,6 +987,23 @@ class SimulationEngine:
             if start:
                 self.state = STATE_IDLE
                 self._reset()
+            else:
+                self._edit_name(btn)
+        if self.state not in (STATE_WIN, STATE_LOSE):
+            self._cursor = 0
+
+    def _edit_name(self, btn):
+        """D/F trocam o caractere no cursor; J/K movem o cursor (nome_perfil.v)."""
+        n = len(NAME_CHARS)
+        c = self._cursor
+        if btn[0]:
+            self._nome[c] = (self._nome[c] - 1) % n
+        elif btn[1]:
+            self._nome[c] = (self._nome[c] + 1) % n
+        if btn[2]:
+            self._cursor = max(0, c - 1)
+        elif btn[3]:
+            self._cursor = min(2, c + 1)
 
     def _start_countdown(self):
         self._reset()
@@ -1044,19 +1084,18 @@ class Renderer:
     def __init__(
         self,
         serial_port="/dev/ttyUSB0",
-        baudrate=115200,
+        baudrate=921_600,
         sim_mode=False,
         scale=None,
         audio_offset_ms=0,
-        pseudonym=None,
         history_path=DEFAULT_HISTORY,
     ):
         self._sim_mode = sim_mode
-        # Sessao: so o pseudonimo identifica a crianca (PRIVACIDADE)
-        self._pseudonym = pseudonym
+        # Sessao: so o nome de 3 caracteres identifica a crianca (PRIVACIDADE)
         self._log = SessionLog(history_path)
         self._session_live = False  # viu PLAY desde o ultimo fim de musica
         self._dash = None  # dados do dashboard, montados ao entrar no fim
+        self._toast = None  # (texto, ok, instante): aviso de gravacao na tela inicial
         # Latencia de saida alem do buffer do mixer (fone Bluetooth, placa de
         # som externa). Positivo: a musica comeca adiantada esse tanto para
         # compensar; negativo: a musica comeca atrasada.
@@ -1087,6 +1126,8 @@ class Renderer:
         self._selected_song = 0
         self._eq = [0, 0, 0, 0]  # niveis do atenuador (FPGA ou simulacao)
         self.fpga_metrics = empty_metrics()  # acumuladores do metricas.v
+        self.fpga_nome = NO_PROFILE  # nome do perfil (nome_perfil.v)
+        self.fpga_cursor = 0
 
         # Audio carregado no mixer: (musica, eq, previa). WAVs filtrados ficam
         # em memoria (nada e gravado em disco) num cache pequeno.
@@ -1441,6 +1482,8 @@ class Renderer:
             self._selected_song = pkt["song_id"]
             self._eq = pkt["eq"]
             self.fpga_metrics = pkt["metrics"]
+            self.fpga_nome = pkt["nome"]
+            self.fpga_cursor = pkt["cursor"]
             self._detect_note_events()
 
     def _detect_note_events(self):
@@ -1525,42 +1568,66 @@ class Renderer:
         self.fpga_combo = pkt["combo"]
         self.fpga_frame_counter = pkt["frame_counter"]
         self.fpga_metrics = pkt["metrics"]
+        self.fpga_nome = pkt["nome"]
+        self.fpga_cursor = pkt["cursor"]
         self._detect_note_events()
 
     # ── Sessao: fecha ao fim da musica ────────────────────────────────────────
 
     def _update_session(self, state):
-        """Monta o dashboard (e grava o historico) uma vez por fim de musica."""
+        """
+        Ao entrar no fim de musica monta o dashboard; enquanto o nome do
+        perfil muda, atualiza a comparacao; ao sair (START), grava a sessao
+        com o nome escolhido.
+        """
         if state == STATE_PLAY:
             self._session_live = True
         if state in (STATE_WIN, STATE_LOSE):
             if self._dash is None:
-                self._dash = self._close_session(won=(state == STATE_WIN))
-        else:
+                self._dash = self._open_dash(won=(state == STATE_WIN))
+            self._refresh_profile()
+        elif self._dash is not None:
+            self._finish_session()
             self._dash = None
 
-    def _close_session(self, won):
+    def _open_dash(self, won):
         m = self.fpga_metrics
-        summ = session_summary(m)
-        prev = self._log.previous(self._pseudonym)
-        if self._session_live:
-            row = session_row(
-                m, self._pseudonym, self._selected_song, won,
-                self.fpga_score, self.fpga_misses,
-            )
-            ok, msg = self._log.append(row)
-        else:
-            # A interface abriu com a musica ja terminada: nao ha sessao inteira
-            ok, msg = False, "Sessao nao gravada: a musica terminou antes de abrir a interface"
-        self._session_live = False
-        return {
+        dash = {
             "won": won,
-            "summary": summ,
-            "deltas": session_deltas(summ, prev),
-            "prev": prev,
-            "saved": ok,
-            "msg": msg,
+            "metrics": {k: (list(v) if isinstance(v, list) else v) for k, v in m.items()},
+            "summary": session_summary(m),
+            "song": self._selected_song,
+            "score": self.fpga_score,
+            "misses": self.fpga_misses,
+            # Sessao inteira vista? (a interface pode abrir com a musica no fim)
+            "live": self._session_live,
+            "name": None,
         }
+        self._session_live = False
+        return dash
+
+    def _refresh_profile(self):
+        """Releitura do historico so quando o nome muda."""
+        dash = self._dash
+        if dash["name"] == self.fpga_nome:
+            return
+        dash["name"] = self.fpga_nome
+        dash["profile"] = profile_of(self.fpga_nome)
+        dash["prev"] = self._log.previous(dash["profile"])
+        dash["deltas"] = session_deltas(dash["summary"], dash["prev"])
+
+    def _finish_session(self):
+        dash = self._dash
+        now = time.monotonic()
+        if not dash["live"]:
+            self._toast = ("Sessao nao gravada: a musica terminou antes de abrir a interface",
+                           False, now)
+            return
+        row = session_row(dash["metrics"], dash["profile"], dash["song"], dash["won"],
+                          dash["score"], dash["misses"])
+        ok, msg = self._log.append(row)
+        who = dash["profile"] or "sem perfil"
+        self._toast = (f"{msg}  ({who})", ok, now)
 
     # ── Spawn de efeitos ──────────────────────────────────────────────────────
 
@@ -1814,6 +1881,12 @@ class Renderer:
             hint_text = ""
         hint = self.font(30).render(hint_text, True, (60, 95, 155))
         self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, _py(540))))
+
+        if self._toast and time.monotonic() - self._toast[2] < TOAST_S:
+            text, ok, _ = self._toast
+            color = (110, 220, 150) if ok else (240, 170, 90)
+            msg = self.font(30).render(text, True, color)
+            self.screen.blit(msg, msg.get_rect(center=(SCREEN_W // 2, _py(470))))
 
     def _wrap_text(self, text, size, max_w):
         """Quebra texto em linhas que cabem em max_w pixels."""
@@ -2164,8 +2237,6 @@ class Renderer:
     def _dash_delta(self, key, unit):
         """Texto e cor da variacao em relacao a sessao anterior."""
         dash = self._dash
-        if not self._pseudonym:
-            return "", self._DASH_MUTED
         if dash["prev"] is None or key not in dash["deltas"]:
             return "", self._DASH_MUTED
         d, better = dash["deltas"][key]
@@ -2191,14 +2262,12 @@ class Renderer:
         self.screen.blit(self.scanline_surf, (0, 0))
 
         cx = SCREEN_W // 2
-        self.screen.blit(self._logo_select, self._logo_select.get_rect(center=(cx, _py(46))))
         title = "VITORIA!" if dash["won"] else "FIM DE JOGO"
-        self._dash_text(title, 60, (0, 190, 255) if dash["won"] else (255, 90, 90),
-                        center=(cx, _py(104)))
-        who = self._pseudonym or "sem pseudonimo"
-        sub = (f"{SONGS[self._selected_song]['title']}   |   {who}   |   "
-               f"Score {self.fpga_score:06d}   |   Erros {self.fpga_misses}")
-        self._dash_text(sub, 28, self._DASH_LABEL, center=(cx, _py(136)))
+        self._dash_text(title, 56, (0, 190, 255) if dash["won"] else (255, 90, 90),
+                        center=(cx, _py(32)))
+        sub = (f"{SONGS[dash['song']]['title']}   |   "
+               f"Score {dash['score']:06d}   |   Erros {dash['misses']}")
+        self._dash_text(sub, 26, self._DASH_LABEL, center=(cx, _py(62)))
 
         # ── Linha de indicadores ─────────────────────────────────────────────
         tiles = []
@@ -2220,48 +2289,97 @@ class Renderer:
         tiles.append(("Maior combo", str(summ["maior_combo"]), "acertos seguidos",
                       "maior_combo", ""))
 
-        TILE_W, TILE_H, GAP = _px(180), _py(118), _px(10)
-        x0 = (SCREEN_W - (4 * TILE_W + 3 * GAP)) // 2
-        top = _py(156)
+        TILE_W, TILE_H, GAP = _px(180), _py(110), _px(10)
+        full_w = 4 * TILE_W + 3 * GAP
+        x0 = (SCREEN_W - full_w) // 2
+        top = _py(80)
         for i, (label, value, note, key, unit) in enumerate(tiles):
             r = pygame.Rect(x0 + i * (TILE_W + GAP), top, TILE_W, TILE_H)
             self._dash_panel(r)
-            self._dash_text(label, 26, self._DASH_LABEL, center=(r.centerx, r.y + _py(16)))
-            self._dash_text(value, 64, self._DASH_TEXT, center=(r.centerx, r.y + _py(50)))
-            self._dash_text(note, 22, self._DASH_MUTED, center=(r.centerx, r.y + _py(80)))
+            self._dash_text(label, 26, self._DASH_LABEL, center=(r.centerx, r.y + _py(15)))
+            self._dash_text(value, 64, self._DASH_TEXT, center=(r.centerx, r.y + _py(46)))
+            self._dash_text(note, 22, self._DASH_MUTED, center=(r.centerx, r.y + _py(74)))
             delta, color = self._dash_delta(key, unit)
             if delta:
-                self._dash_text(delta, 22, color, center=(r.centerx, r.y + _py(100)))
+                self._dash_text(delta, 22, color, center=(r.centerx, r.y + _py(94)))
 
-        # ── Paineis inferiores ───────────────────────────────────────────────
-        PANEL_W = (4 * TILE_W + 3 * GAP - GAP) // 2
-        ptop, ph = top + TILE_H + _py(12), _py(196)
+        # ── Paineis do meio ──────────────────────────────────────────────────
+        PANEL_W = (full_w - GAP) // 2
+        ptop, ph = top + TILE_H + _py(10), _py(176)
         self._draw_dash_tracks(pygame.Rect(x0, ptop, PANEL_W, ph), summ)
         self._draw_dash_timing(
             pygame.Rect(x0 + PANEL_W + GAP, ptop, PANEL_W, ph), summ
         )
 
+        # ── Perfil (nome arcade) ─────────────────────────────────────────────
+        prof_top = ptop + ph + _py(10)
+        self._draw_dash_profile(pygame.Rect(x0, prof_top, full_w, _py(120)))
+
         # ── Rodape ───────────────────────────────────────────────────────────
-        y = ptop + ph + _py(18)
+        y = prof_top + _py(120) + _py(16)
         self._dash_text(
             "Gestos: ainda nao disponivel   |   Metronomo: ainda nao disponivel",
-            22, self._DASH_MUTED, center=(cx, y),
+            20, self._DASH_MUTED, center=(cx, y),
         )
-        prev = dash["prev"]
-        if prev is not None:
-            when = prev.get("data_hora", "").replace("T", " ")[:16]
-            compare = f"Comparado com a sessao de {when} ({prev.get('musica', '')})"
-        elif self._pseudonym:
-            compare = f"Primeira sessao de {self._pseudonym} no historico"
-        else:
-            compare = "Sem pseudonimo: sem comparacao (use --pseudonimo)"
-        self._dash_text(compare, 22, self._DASH_LABEL, center=(cx, y + _py(20)))
-        self._dash_text(dash["msg"], 20,
-                        self._DASH_MUTED if dash["saved"] else self._DASH_WORSE,
-                        center=(cx, y + _py(38)))
+        start = "SPACE" if self._sim_mode else "START"
+        self._dash_text(f"Escolha o perfil e aperte {start} para salvar", 36,
+                        (255, 130, 0), center=(cx, y + _py(30)))
 
-        back = "SPACE = voltar" if self._sim_mode else "Aperte START para voltar"
-        self._dash_text(back, 36, (255, 130, 0), center=(cx, y + _py(66)))
+    def _draw_dash_profile(self, rect):
+        """
+        Nome do perfil em estilo arcade: 3 caixas, a do cursor destacada com
+        borda laranja e seta. Estatico (sem piscar).
+        """
+        dash = self._dash
+        self._dash_panel(rect)
+        x, y = rect.x + _px(14), rect.y
+        self._dash_text("Perfil", 28, self._DASH_TEXT, midleft=(x, y + _py(18)))
+
+        BOX_W, BOX_H, BOX_GAP = _px(46), _py(62), _px(10)
+        box_top = y + _py(34)
+        hl = (255, 130, 0)
+        for k, ch in enumerate(self.fpga_nome):
+            r = pygame.Rect(x + k * (BOX_W + BOX_GAP), box_top, BOX_W, BOX_H)
+            active = k == self.fpga_cursor
+            pygame.draw.rect(self.screen, (24, 36, 72) if active else (14, 22, 48), r,
+                             border_radius=6)
+            pygame.draw.rect(self.screen, hl if active else self._DASH_BORDER, r,
+                             3 if active else 2, border_radius=6)
+            self._dash_text(ch, 72, self._DASH_TEXT, center=(r.centerx, r.centery + _py(3)))
+            if active:
+                tip = r.bottom + _py(5)
+                pygame.draw.polygon(self.screen, hl, [
+                    (r.centerx, tip), (r.centerx - _px(7), tip + _py(9)),
+                    (r.centerx + _px(7), tip + _py(9)),
+                ])
+
+        # Comandos
+        hx = x + 3 * (BOX_W + BOX_GAP) + _px(26)
+        for i, (keys, what) in enumerate((("D / F", "trocar a letra"),
+                                          ("J / K", "mudar de posicao"))):
+            ly = y + _py(52) + i * _py(30)
+            self._dash_text(keys, 30, self._DASH_TEXT, midleft=(hx, ly))
+            self._dash_text(what, 26, self._DASH_LABEL, midleft=(hx + _px(70), ly))
+
+        # Situacao do perfil e da comparacao
+        sx = rect.x + rect.w // 2 + _px(40)
+        prev, profile = dash["prev"], dash["profile"]
+        if profile is None:
+            lines = [(f"Sem perfil ({NO_PROFILE})", self._DASH_TEXT),
+                     ("a sessao e salva sem nome", self._DASH_LABEL),
+                     ("e sem comparacao", self._DASH_LABEL)]
+        elif prev is not None:
+            when = prev.get("data_hora", "")
+            when = f"{when[8:10]}/{when[5:7]} {when[11:16]}" if len(when) >= 16 else when
+            lines = [(f"Perfil {profile}", self._DASH_TEXT),
+                     (f"comparado com a sessao de {when}", self._DASH_LABEL),
+                     (prev.get("musica", ""), self._DASH_MUTED)]
+        else:
+            lines = [(f"Perfil {profile}", self._DASH_TEXT),
+                     ("primeira sessao deste perfil", self._DASH_LABEL)]
+        for i, (text, color) in enumerate(lines):
+            self._dash_text(text, 30 if i == 0 else 24, color,
+                            midleft=(sx, y + _py(30) + i * _py(28)))
 
     def _draw_dash_tracks(self, rect, summ):
         """Acertos por trilha: medidor por trilha + resumo por mao."""
@@ -2271,7 +2389,7 @@ class Renderer:
                         midleft=(x, y + _py(18)))
         BAR_X, BAR_W, BAR_H = x + _px(28), _px(190), _py(14)
         for t, (hits, notes) in enumerate(summ["trilhas"]):
-            ry = y + _py(48) + t * _py(28)
+            ry = y + _py(44) + t * _py(26)
             self._dash_text(TRACK_LABELS[t], 30, self._DASH_TEXT, midleft=(x, ry))
             color = TRACK_COLORS[t]
             track_col = tuple(int(c * 0.28) for c in color)
@@ -2287,14 +2405,15 @@ class Renderer:
                 txt = "sem notas"
             self._dash_text(txt, 24, self._DASH_LABEL,
                             midleft=(BAR_X + BAR_W + _px(10), ry))
-        hy = y + _py(48) + 4 * _py(28) + _py(4)
+        hy = y + _py(44) + 4 * _py(26) + _py(6)
         pygame.draw.line(self.screen, self._DASH_BORDER, (x, hy - _py(10)),
                          (rect.right - _px(14), hy - _py(10)), 1)
+        parts = []
         for i, (name, hits, notes) in enumerate(summ["maos"]):
             keys = "+".join(TRACK_LABELS[t] for t in HANDS[i][1])
             val = f"{100 * hits // notes}%" if notes else "--"
-            self._dash_text(f"{name} ({keys}): {val}", 24, self._DASH_LABEL,
-                            midleft=(x, hy + i * _py(20)))
+            parts.append(f"{name} ({keys}): {val}")
+        self._dash_text("   |   ".join(parts), 24, self._DASH_LABEL, midleft=(x, hy))
 
     def _draw_dash_timing(self, rect, summ):
         """Assincronia: eixo da janela de acerto com a media e a faixa +-desvio."""
@@ -2343,11 +2462,11 @@ class Renderer:
         pygame.draw.circle(self.screen, (0, 180, 255), (mx, ay - _py(24)), _ps(5))
 
         self._dash_text(f"media {mean:+.0f} ms   (faixa = media +- desvio)", 22,
-                        self._DASH_LABEL, midleft=(x, rect.y + _py(150)))
+                        self._DASH_LABEL, midleft=(x, rect.y + _py(140)))
         self._dash_text(
             f"erro medio {summ['abs_media_ms']:.0f} ms   |   janela +-{lim_ms:.0f} ms"
             f"   |   1 quadro = {FRAME_MS:.1f} ms",
-            20, self._DASH_MUTED, midleft=(x, rect.y + _py(172)),
+            20, self._DASH_MUTED, midleft=(x, rect.y + _py(160)),
         )
 
     # ── Loop principal ────────────────────────────────────────────────────────
@@ -2419,7 +2538,8 @@ if __name__ == "__main__":
         help="Porta serial da FPGA (padrao: /dev/ttyUSB0)",
     )
     parser.add_argument(
-        "--baud", type=int, default=115200, help="Baudrate UART (padrao: 115200)"
+        "--baud", type=int, default=921_600,
+        help="Baudrate UART (padrao: 921600; igual ao parametro BAUD do projeto.v)"
     )
     parser.add_argument(
         "--sim",
@@ -2441,20 +2561,12 @@ if __name__ == "__main__":
         help="Escala da janela sobre 1800x1080, ex.: 0.6 (padrao: cabe em 90%% da tela)",
     )
     parser.add_argument(
-        "--pseudonimo",
-        default=None,
-        help="Pseudonimo da crianca (nunca o nome): letras, digitos, _ e -, ate 24. "
-        "Identifica as sessoes no historico e habilita a comparacao com a anterior",
-    )
-    parser.add_argument(
         "--historico",
         default=DEFAULT_HISTORY,
         metavar="CSV",
         help="Arquivo CSV do historico de sessoes (padrao: sessoes/sessoes.csv)",
     )
     args = parser.parse_args()
-    if args.pseudonimo is not None and not PSEUDONYM_RE.match(args.pseudonimo):
-        parser.error("--pseudonimo: use so letras, digitos, _ e - (ate 24)")
 
     Renderer(
         serial_port=args.port,
@@ -2462,6 +2574,5 @@ if __name__ == "__main__":
         sim_mode=args.sim,
         scale=args.scale,
         audio_offset_ms=args.audio_offset,
-        pseudonym=args.pseudonimo,
         history_path=args.historico,
     ).run()

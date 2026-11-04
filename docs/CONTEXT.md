@@ -9,8 +9,8 @@ Layout: `rtl/` (Verilog + Quartus + charts `.hex`), `tb/` (testbenches), `pc/` (
 ## Arquitetura
 
 ```
-FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
-  projeto.v           (46 bytes/frame)    interface.py
+FPGA (Verilog) ──UART 921600───► Python (Pygame)
+  projeto.v           (49 bytes/frame)    interface.py
   unidade_controle.v                      SimulationEngine (--sim)
   fluxo_dados.v
   packet_sender.v
@@ -28,7 +28,7 @@ FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
   prévia de 10 s em loop enquanto o jogador ajusta.
 - **Dashboard de fim de sessão (DASHBOARD_SESSAO)**: ao fim da música (WIN/LOSE) o PC mostra
   taxa de acerto, assincronia média e desvio-padrão (ms), maior combo, acertos por trilha e por
-  mão (D+F, J+K) e a variação em relação à sessão anterior do mesmo pseudônimo. Gesto e
+  mão (D+F, J+K) e a variação em relação à sessão anterior do mesmo perfil. Gesto e
   metrônomo aparecem como "ainda não disponível". A tela é estática (sem piscar).
   - **Métricas na FPGA** (`metricas.v`, dentro do `fluxo_dados`): a cada acerto,
     `e = age − 130` quadros (negativo = adiantado); acumula N, Σe, Σ|e|, Σe², notas julgadas e
@@ -38,11 +38,20 @@ FPGA (Verilog) ──UART 115200 baud──► Python (Pygame)
     sequencial `taxa_acerto.v`), sem zeros à esquerda; fora do END, HEX0 = estado,
     HEX1 = jogada, HEX2 apagado. Porta nova `db_hex2` no top (pinos Y19…AB21, mesma ordem
     de bits do HEX0/HEX1: `[0]` = segmento `a`).
-  - **Histórico local**: `--pseudonimo NOME` (só letras, dígitos, `_`, `-`; nunca o nome da
-    criança). Cada música terminada vira uma linha em `sessoes/sessoes.csv` (`--historico` muda
-    o caminho; a pasta está no `.gitignore`). Falha de disco só gera aviso. É a base do MQTT
-    da Semana 4 (mesmos campos, `session_row`). Se a interface abrir com a música já no fim,
-    a sessão não é gravada.
+  - **Perfil estilo arcade** (`nome_perfil.v`, dentro do `fluxo_dados`): no dashboard a
+    criança escolhe 3 caracteres (`-`, A–Z, 0–9) com os botões: D/F = caractere
+    anterior/próximo (37 valores, dá a volta), J/K = cursor para esquerda/direita (para nas
+    pontas). START salva e volta à tela inicial. O nome fica guardado até o reset da FPGA
+    (a próxima sessão já começa com ele); `---` = sem perfil. O PC só desenha: a caixa do
+    cursor fica com borda laranja e um triângulo embaixo. Ao trocar o nome, a comparação
+    com a sessão anterior é refeita na hora.
+  - **Histórico local**: a sessão é gravada **ao apertar START no dashboard** (saída de
+    WIN/LOSE), com o nome escolhido como pseudônimo (`---` grava sem pseudônimo e sem
+    comparação), em `sessoes/sessoes.csv` (`--historico` muda o caminho; a pasta está no
+    `.gitignore`). Fechar a interface no dashboard perde a sessão. Um aviso aparece na tela
+    inicial por 6 s. Falha de disco só gera aviso. É a base do MQTT da Semana 4 (mesmos
+    campos, `session_row`). Se a interface abrir com a música já no fim, a sessão não é
+    gravada.
 
 ---
 
@@ -135,7 +144,14 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 
 ## Protocolo UART (FPGA → Python)
 
-Pacote de 46 bytes a 60fps (~4 ms de transmissão por quadro de 16,7 ms):
+Pacote de 49 bytes a 60fps, 921600 baud 8N1 (~0,53 ms de transmissão por quadro de 16,7 ms).
+A velocidade é o parâmetro `BAUD` do `projeto.v` (50 MHz / 921600 = 54 ciclos/bit → 925926 baud,
++0,5%) e o `--baud` do PC (padrão 921600); os dois precisam bater. Para voltar a 115200:
+`BAUD = 115_200` e `--baud 115200`. **Não usar 1 Mbaud**: o CP2102 original só tem até 921600 na
+tabela padrão, então o pedido de 1000000 vira ~921600 no conversor (8% de erro) e nenhum pacote
+chega inteiro (a tela fica parada na tela inicial e o LEDR3 apagado). A folga sobra para os
+dados do sensor e do servo-metrônomo. Diagnóstico na bancada: `uv run
+pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados vistos).
 ```
 [0]  = 0x55 (header)
 [1]  = {eq[3:0], state}: state nos 4 bits baixos (0=idle,1=countdown,2=play,3=pause,
@@ -153,7 +169,11 @@ Pacote de 46 bytes a 60fps (~4 ms de transmissão por quadro de 16,7 ms):
 [27..29] = Σ|e| (24 bits)
 [30..32] = Σe² (24 bits)
 [33..44] = por trilha t, 3 bytes a partir de 33+3t: {notas[t] 12 bits, acertos[t] 12 bits}
-[45] = 0xAA (footer)
+--- nome do perfil (nome_perfil.v) ---
+[45] = {cursor[1:0], c0[5:0]}   c0 = caractere da esquerda
+[46] = {2'b00, c1[5:0]}
+[47] = {2'b00, c2[5:0]}         código: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
+[48] = 0xAA (footer)
 ```
 
 ---
@@ -162,8 +182,7 @@ Pacote de 46 bytes a 60fps (~4 ms de transmissão por quadro de 16,7 ms):
 
 ```bash
 uv run pc/interface.py --sim          # modo simulação (sem FPGA)
-uv run pc/interface.py --sim --pseudonimo ana01   # grava o histórico e compara sessões
-uv run --extra fpga pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
+uv run pc/interface.py --port /dev/cu.usbserial-XXXX  # modo FPGA (macOS)
 python pc/interface.py --port COM3    # modo FPGA (Windows)
 python pc/interface.py --port /dev/ttyUSB0  # modo FPGA (Linux)
 ```
@@ -194,15 +213,18 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose; idle↔settings) |
 | `eq_config.v` | Níveis do atenuador de frequências (2 bits por faixa) |
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
-| `packet_sender.v` | Serializa estado em pacote UART (46 bytes) |
+| `packet_sender.v` | Serializa estado em pacote UART (49 bytes) |
 | `note_track.v` | 1 trilha com 3 slots de nota; `hit_age` = idade da nota acertada |
 | `metricas.v` | Acumuladores da sessão: N, Σe, Σ\|e\|, Σe², notas/acertos por trilha, maior combo |
 | `taxa_acerto.v` | Divisor sequencial: taxa de acerto em % e dígitos para o HEX |
+| `nome_perfil.v` | Nome do perfil em 3 caracteres, editado com D/F/J/K no fim da música |
 | `debounce_pulse.v` | Debounce + detecção de borda |
 | `contador_m.v` | Contador parametrizável |
 
 Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note_track` reais),
-`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (46 bytes),
+`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (49 bytes),
+`tb_nome_perfil.v`, `tb_nome_top.v` (nome com os botões reais pelo debounce),
+`tb_baud_top.v` (top a 921600: pacote no pino TX, ACK no RX a 921600, 923077 e ±2%),
 `tb_note_track.v`, `tb_fd.v`, `tb_uc_*.v`, etc. `tb_countdown_transition.v` falha desde antes
 (segura o reset ativo e referencia um `u_game_timer` que não existe).
 

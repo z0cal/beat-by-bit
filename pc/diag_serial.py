@@ -71,11 +71,11 @@ def testa(port, baud, segundos):
         print("  estados vistos  : " + " -> ".join(STATE_NAMES.get(s, str(s)) for s in estados))
     if ultimo:
         u = ultimo
-        print(f"  ultimo pacote   : dist {u['dist_cm']} cm, gesto_age {u['gesto_age']:#04x}, "
-              f"gestos {u['gestos_acert']}/{u['gestos_apres']}, modo_met {u['modo_met']}, "
-              f"sensorial {int(u['sensorial'])}, sem_som {int(u['sem_som'])}, "
-              f"pagina {u['pagina']}, progresso {u['progresso']}, "
-              f"met nivel {u['met_nivel']} lado {u['met_lado']}")
+        print(f"  ultimo pacote   : dist {u['dist_cm']} cm, energia {u['energia']}, "
+              f"x2 {int(u['x2_ativo'])} (ativ {u['ativacoes']}), mov {u['movimentos']}, "
+              f"modo_met {u['modo_met']}, sensorial {int(u['sensorial'])}, "
+              f"sem_som {int(u['sem_som'])}, pagina {u['pagina']}, "
+              f"progresso {u['progresso']}, met nivel {u['met_nivel']} lado {u['met_lado']}")
     if total == 0:
         print("  >> nada chegou: confira GND comum, TX da FPGA (PIN_N16) no RXD do conversor,")
         print("     reset solto (HEX0 aceso) e se a porta e a certa")

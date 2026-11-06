@@ -19,7 +19,7 @@ FPGA (Verilog) ──UART 921600───► Python (Pygame)
 - **FPGA**: lógica do jogo (FSM, notas, score) e métricas da sessão. Envia pacotes UART de 46
   bytes a 60fps.
 - **Python**: renderiza o que recebe via UART. Em `--sim`, roda a FSM localmente sem FPGA.
-- **Teclas (sim)**: D/F/J/K = trilhas 0-3 | SPACE = START/PAUSE | ESC = voltar (pausa)
+- **Teclas (sim)**: D/F/J/K = trilhas 0-3 | SPACE = START/PAUSE | G = mão parada (15 cm) | H = mão mexendo (10↔20 cm) | ESC = voltar (pausa)
 - **Configurações de som (estado SETTINGS = 7)**: na tela inicial, qualquer botão de trilha
   abre o atenuador de frequências; START volta. Lá, cada botão avança o nível da sua faixa
   (0 → −6 → −12 → −18 dB → 0): D = graves (< 250 Hz), F = médios (250 Hz–2 kHz),
@@ -28,8 +28,8 @@ FPGA (Verilog) ──UART 921600───► Python (Pygame)
   prévia de 10 s em loop enquanto o jogador ajusta.
 - **Dashboard de fim de sessão (DASHBOARD_SESSAO)**: ao fim da música (WIN/LOSE) o PC mostra
   taxa de acerto, assincronia média e desvio-padrão (ms), maior combo, acertos por trilha e por
-  mão (D+F, J+K) e a variação em relação à sessão anterior do mesmo perfil. Gesto e
-  metrônomo aparecem como "ainda não disponível". A tela é estática (sem piscar).
+  mão (D+F, J+K), movimentos da mão e ativações do `x2`, além da variação em relação à sessão
+  anterior do mesmo perfil (tempo por nível do metrônomo entra na Semana 4). A tela é estática (sem piscar).
   - **Métricas na FPGA** (`metricas.v`, dentro do `fluxo_dados`): a cada acerto,
     `e = age − 130` quadros (negativo = adiantado); acumula N, Σe, Σ|e|, Σe², notas julgadas e
     acertos por trilha (12 bits) e o maior combo. Zera em COUNTDOWN; congela em PAUSE/END/IDLE.
@@ -196,26 +196,32 @@ pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados visto
 [45] = {cursor[1:0], c0[5:0]}   c0 = caractere da esquerda
 [46] = {2'b00, c1[5:0]}
 [47] = {2'b00, c2[5:0]}         código: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
---- semana 3: sensor, gesto, configuração e metrônomo ---
+--- semana 3: sensor, barra de energia (x2), configuração e metrônomo ---
 [48] = distância do HC-SR04 em cm (satura em 255; 0 = sem eco/timeout)
-[49] = idade da nota de gesto (5ª trilha, slot 0; 0xFF = nenhuma)
-[50] = gestos apresentados (julgados: acerto + escape)
-[51] = gestos acertados
+[49] = energia (0..255; durante o x2 = tempo restante escalado linearmente)
+[50] = {x2_ativo, ativacoes[6:0]} (ativações saturam em 127)
+[51] = movimentos[15:8]
 [52] = {progresso[2:0], pagina, sem_som, sensorial, modo_met[1:0]}
        modo_met 0 = desligado, 1 = fixo (2 = adaptativo, S4); pagina 0 = Som, 1 = Jogo;
        progresso = gesto de confirmação 0..7
 [53] = {5'b0, lado, nivel[1:0]}  nivel 0 = 60°, 1 = 30°, 2 = 15°, 3 = parado
-[54] = 0x00 (reservado)
+[54] = movimentos[7:0]
 [55] = 0xAA (footer)
 ```
 
-### Gesto, configurações e metrônomo (Semana 3)
+### Barra de energia, configurações e metrônomo (Semana 3)
 
-- **ROM de 5 bits**: bits [3:0] = trilhas, bit 4 = nota de gesto (sozinha no quadro, ≥ 600 quadros
-  entre gestos, 60 quadros livres em volta; 4 por música). Checar com `uv run python pc/verifica_charts.py`.
-- **Nota de gesto** (`fluxo_dados.v`): 5ª `note_track` com `btn_press = gesto_pulso` (uma leitura
-  do HC-SR04 com a mão entre 5 e 25 cm). Acerto = +100 + combo; escape = miss; mão fora da janela é
-  ignorada (`bad_press` descartado). Não entra em `metricas.v` (assincronia/trilhas).
+- **ROM de 4 bits**: bits `[3:0]` = trilhas de botão (sem notas de sensor; as notas de botão antes
+  removidas voltaram: 74/57/86/67). Checar com `uv run python pc/verifica_charts.py` (exige zero gestos).
+- **Barra de energia e multiplicador x2** (`energia.v`, em `fluxo_dados.v`): conta apenas em PLAY
+  (`game_active`), congela em PAUSE e zera em COUNTDOWN (como `metricas.v`). Cada leitura válida do
+  HC-SR04 (`5 ≤ dist_cm ≤ 30`; leituras 0 e fora da faixa são ignoradas e desarmam a comparação)
+  soma `+1` de presença (~15 s com a mão parada); se a leitura anterior também foi válida e
+  `|dist − dist_anterior| ≥ 3 cm`, soma `+2` extras (`+3` no total, ~5 s mexendo) e conta 1
+  `movimento` (16 bits). Ao saturar em `255`, liga `x2_ativo` automaticamente por `480` quadros
+  (`8 s`), esvaziando linearmente sem encher e incrementando `ativacoes` (7 bits, satura em 127).
+  Com `x2_ativo`, cada acerto de botão soma `2 × (100 + combo)`; sem punição, nunca gera erro e não
+  altera `metricas.v`.
 - **HC-SR04** (`hcsr04.v`): TRIG de 10 µs a cada 60 ms, ECHO sincronizado, cm = µs/58, timeout 25 ms.
 - **Gesto de confirmação** (`gesto_detector.v`, só em SETTINGS): 16 leituras seguidas na faixa
   (~1 s) geram um pulso que troca a página; só rearma após 4 leituras fora. Evita disparo acidental.
@@ -224,8 +230,12 @@ pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados visto
 - **Metrônomo** (`metronomo.v` + `servo_pwm.v`): período e fase em ciclos de 50 MHz vindos de
   `rtl/bpm_params.vh` (gerado por `gerar_hex.py`; suporta uma troca de andamento: Pokémon 192→136 BPM
   no tempo 40). Braço ±30° no modo fixo, centro fora do PLAY/pausa/desligado. PWM 50 Hz, 1–2 ms.
-- **PC**: perfil sensorial = música a 50% e efeitos intensos desligados (fica um anel fino);
-  sem som = volume 0 (a música segue, o sync não muda). No `--sim`, **G** = mão no sensor.
+- **PC**: barra de energia vertical ao lado da pista (brilha mais quando há movimento) + medidor da
+  mão ao vivo (acende em 5–30 cm); no x2, trilhas/bordas douradas e selo `"x2"` com tempo restante;
+  perfil sensorial = música a 50% e versão calma sem piscar nem partículas (só cor e barra); sem som
+  = volume 0 (a música segue, o sync não muda). No `--sim`, **G** segurada = mão parada a 15 cm,
+  **H** segurada = vai-e-vem 10↔20 cm a cada leitura (~60 ms), soltar = sem eco (0). CSV grava
+  `movimentos` e `ativacoes_x2` com migração aditiva que preserva CSVs antigos.
 
 ---
 
@@ -238,16 +248,15 @@ Registro do *porquê* de cada escolha; o *o quê* está nas seções acima.
 | **Sem chaves SW.** Metrônomo, perfil sensorial e sem som são escolhidos na página "Jogo" da tela de configurações | As chaves são de difícil acesso na maquete; a S2 já tinha migrado a configuração para telas com os botões das trilhas. Substitui o SW0–SW3 da especificação (registrar como desvio) |
 | **HC-SR04 como entrada da tela de configurações**: segurar a mão entre 5 e 25 cm troca a página | Dá um "botão" extra sem fiação nova |
 | Gesto de confirmação exige **16 leituras seguidas na faixa (~1 s)**; uma leitura fora zera; rearma só após **4 leituras fora** | O sensor dispara fácil por acidente (mão passando, corpo da criança); segurar 1 s e ter de tirar a mão evita trocas repetidas |
-| Gesto de confirmação **só em SETTINGS**; em PLAY vale só a nota de gesto | Evita trocar configuração no meio da música |
+| Gesto de confirmação **só em SETTINGS**; em PLAY o sensor alimenta a **barra de energia** | Evita trocar configuração no meio da música |
 | Gesto troca **página**, não confirma valor; START continua sendo "salvar e voltar" | Mantém o modelo da S2; um disparo acidental só muda a aba exibida, nunca um ajuste |
 | Página "Jogo": D = metrônomo desligado↔fixo (adaptativo só na S4), F = sensorial, J = sem som, K reservado | Uma tecla por opção, sem menus; K livre para a janela configurável (opcional) |
 | Registradores de configuração **zeram só no reset** (como `eq_config`) | A configuração vale para várias crianças/sessões seguidas |
-| Nota de gesto = **5ª `note_track`** com a mesma física (idade, janela ±11, escape em 151) | Reuso do módulo testado; o aviso de 2,2 s sai de graça (130 quadros de queda) |
-| Gesto: acerto **+100 + combo** e conta no combo/maior combo; escape = **miss**; mão fora da janela é **ignorada** | Gesto é parte da música, mas o sensor não pode punir a criança por mexer a mão (`bad_press` descartado) |
-| Gesto **fora de `metricas.v`** (assincronia, notas/acertos por trilha) | A resolução do sensor (~60 ms por leitura) não serve para medir assincronia; o gesto tem contadores próprios no pacote |
-| **"Gestos apresentados" = julgados** (acerto + escape), não spawnados | A nota só "conta" quando sai; ao fim da música é igual ao total. O `--sim` segue a mesma regra |
-| Até **4 gestos por música**, ≥ 10 s entre gestos, 1 s sem notas de botão em volta, nenhum nos primeiros 10 s | ESPACAMENTO_GESTO; poucos gestos pela alternância botão↔mão (risco na especificação). Algumas notas de botão foram removidas (Condado 74→68, Pokémon 67→60) |
-| Bit 4 da ROM = gesto, **sozinho no quadro** | Simplifica o desenho (barra cobrindo as 4 trilhas) e o julgamento |
+| **Barra de energia (`energia.v`) + multiplicador `x2` automático no lugar da nota de gesto** | O usuário rejeitou o gesto em hora marcada (uma barra solta exigindo a mão num instante fixo) e preferiu o sensor alimentando um multiplicador sem punição, coerente com o público TEA (validado contra Star Power do Guitar Hero e notas AIR do Chunithm) |
+| **ROM volta a 4 bits (`[3:0]`) sem notas de sensor** | As notas de botão antes removidas para abrir espaço aos gestos voltaram (Condado 68→74, Rangers 85→86, Pokémon 60→67), mantendo a melodia completa |
+| **Faixa `5..30 cm`: presença `+1` (~15 s) e movimento `\|Δdist\| ≥ 3 cm` `+2` extra (~5 s)** | Leituras `0` (sem eco) e fora da faixa são ignoradas e exigem duas leituras válidas seguidas para contar movimento; premia aproximar/afastar a mão sem punir quem só a posiciona |
+| **`x2` ativa em `255` por `480` quadros (`8 s`), esvaziando linearmente sem reencher** | Dobra os pontos de botão (`2 × (100 + combo)`) de forma automática, sem gerar erro nem alterar `metricas.v`, combo ou assincronia |
+| **`energia.v` zera no COUNTDOWN e congela fora de PLAY** | Segue o modelo de `metricas.v`: preserva `movimentos` e `ativacoes` no dashboard ao fim da música e congela o `x2` na pausa |
 | Andamento por música em `bpm_params.vh` com **um segundo segmento** (`PERIODO2`, `NTROCA`) | O MIDI do Pokémon muda de 192 para 136 BPM no tempo 40; com um só período o metrônomo saía ~20 s de fase. Mais de 2 andamentos: só os 2 primeiros (com aviso) |
 | `FASE` = instante em que o tempo **chega ao alvo**, não o spawn | O metrônomo tem de bater junto com a nota na hit zone |
 | Metrônomo **congela em PAUSE** e reinicia em IDLE/SELECT/COUNTDOWN | Não perde a fase com a pausa. Jitter de até 1 quadro na entrada do PLAY (não alinhado ao `frame_tick`), aceito |
@@ -255,10 +264,10 @@ Registro do *porquê* de cada escolha; o *o quê* está nas seções acima.
 | `bpm_params.vh` incluído com **`ifdef QUARTUS`** (`../../rtl/` vs `rtl/`) | Mesmo truque dos `$readmemh`; o `check` do iverilog não aceita `-I` |
 | HC-SR04 **alimentado a 3,3 V**, ECHO direto no GPIO, **sem divisor** | Ensaio da S1: com 3,3 V o eco não passa de 3,3 V (COMPATIBILIDADE_ELETRICA). Não ligar a 5 V |
 | Pinos: TRIG C16 (JP1-4), ECHO K20 (JP1-6), servo K22 (JP1-8) | Os da S1 (GPIO_0_D3/D5/D7). **Conferir no Pin Planner** antes de ligar |
-| Perfil sensorial = música a **50% (0,35)** + sem bursts/partículas/flash/pulsos; fica **um anel fino** no acerto | PERFIL_SENSORIAL sem violar LATENCIA_FEEDBACK (o retorno visual não pode sumir) |
+| Perfil sensorial = música a **50% (0,35)** + sem bursts/partículas/flash/pulsos; fica **um anel fino** no acerto e **barra/x2 calmos** | PERFIL_SENSORIAL sem violar LATENCIA_FEEDBACK (o retorno visual não pode sumir) |
 | Sem som = **volume 0**, a música continua tocando | Parar o mixer quebraria a sincronia chart × áudio e a prévia de 10 s |
 | **Sincronia: `CHART_LEAD_FRAMES = 6` fixo + `round()` + `play` por amostra ancorado no quadro 0 do PLAY** | Notas chegavam 8–33 ms antes do som (int() truncava, buffer 93 ms vs 100 ms, play no quadro em que o PC percebia o PLAY). Ver "Sincronia chart × áudio" |
-| Pacote **56 bytes** (≤ 64 do PACOTE_METRICAS), byte 54 reservado | Folga para o nível adaptativo/tempo por nível da S4 |
+| Pacote **56 bytes** (≤ 64 do PACOTE_METRICAS): bytes 49=`energia`, 50=`{x2_ativo, ativacoes[6:0]}`, 51/54=`movimentos[15:0]` | Reaproveita os bytes do antigo gesto e o byte 54 antes reservado sem aumentar o pacote |
 
 Pendências que ficaram de fora: tempo por nível do metrônomo e modo adaptativo (S4), confirmação
 de pinos e síntese no Quartus, ensaio na placa (sensor a 5/15/25 cm, servo no tempo, falsos
@@ -303,7 +312,8 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
 | `packet_sender.v` | Serializa estado em pacote UART (56 bytes) |
 | `hcsr04.v` | Medidor de distância (TRIG/ECHO → cm) |
-| `gesto_detector.v` | Mão na faixa, pulso de gesto e gesto de confirmação |
+| `energia.v` | Barra de energia pelo HC-SR04 (presença + movimento) e multiplicador `x2` automático |
+| `gesto_detector.v` | Gesto de confirmação na tela de configurações (16 leituras na faixa) |
 | `cfg_jogo.v` | Página de configurações, modo do metrônomo, perfil sensorial, sem som |
 | `metronomo.v` / `servo_pwm.v` | Tempo da música e PWM do servo SG90 |
 | `bpm_params.vh` | Período/fase/troca de andamento por música (gerado) |
@@ -318,7 +328,8 @@ Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note
 `tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (56 bytes),
 `tb_nome_perfil.v`, `tb_nome_top.v` (nome com os botões reais pelo debounce),
 `tb_baud_top.v` (top a 921600: pacote no pino TX, ACK no RX a 921600, 923077 e ±2%),
-`tb_note_track.v`, `tb_fd.v` (inclui gesto e páginas com modelo de eco), `tb_hcsr04.v`,
+`tb_note_track.v`, `tb_energia.v` (enchimento parada/movendo, leituras inválidas, saturação, x2, pausa, COUNTDOWN),
+`tb_fd.v` (inclui energia, score em dobro com x2 e páginas com modelo de eco), `tb_hcsr04.v`,
 `tb_gesto_detector.v`, `tb_cfg_jogo.v`, `tb_metronomo.v`, `tb_servo_pwm.v`, `tb_countdown_transition.v`
 (corrigido na S3), `tb_uc_*.v`, etc.
 

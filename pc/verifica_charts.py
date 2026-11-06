@@ -3,9 +3,8 @@ Verifica os charts (rtl/*.hex) e o rtl/bpm_params.vh gerados por gerar_hex.py.
 
 Por musica:
   - formato: uma linha de 2 digitos hex, profundidade = int(duracao * 60);
-  - gestos (bit 4): sozinhos no quadro (sem bits de trilha), >= GESTO_MIN_GAP_FRAMES entre
-    gestos, nenhuma nota de botao a menos de GESTO_CLEAR_FRAMES (antes e depois),
-    primeiro gesto >= GESTO_FIRST_FRAME e frame + 153 < total;
+  - notas: apenas trilhas de botao (bits 0..3), zero gestos (bit 4 sempre 0, nenhum bit
+    acima do 3 em uso) e toda nota julgada antes do fim (frame + 153 < total);
   - metronomo: PERIODO_n/FASE_n do .vh batem com o MIDI e a deriva (acumular o periodo
     inteiro em ciclos vs. o periodo exato do MIDI) fica < 1 quadro ate o fim da musica.
     Se o MIDI muda de andamento, o desvio contra o mapa de andamentos real vira AVISO.
@@ -24,8 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mido
 
 from interface import (
-    BPM_VH, CLOCK_HZ, FPS, FRAME_CYCLES, GESTO_BIT, GESTO_CLEAR_FRAMES,
-    GESTO_FIRST_FRAME, GESTO_MIN_GAP_FRAMES, SONGS, _LANE_SLOT_SPAN, _abs_events,
+    BPM_VH, CLOCK_HZ, FPS, FRAME_CYCLES, SONGS, _LANE_SLOT_SPAN, _abs_events,
 )
 
 
@@ -81,24 +79,16 @@ def main():
             erros.append(f"profundidade {total} != int({song['duration']}*60)")
 
         botoes = [f for f, v in enumerate(rom) if v & 0xF]
-        gestos = [f for f, v in enumerate(rom) if v & (1 << GESTO_BIT)]
-        if any(v & ~0x1F for v in rom):
-            erros.append("bits acima do 4 em uso")
-        for g in gestos:
-            if rom[g] & 0xF:
-                erros.append(f"gesto em {g} com bits de trilha")
-            if g + _LANE_SLOT_SPAN + 1 >= total:
-                erros.append(f"gesto em {g} nao e julgado antes do fim (frame + 153 >= {total})")
-            near = [b for b in botoes if abs(b - g) < GESTO_CLEAR_FRAMES]
-            if near:
-                erros.append(f"gesto em {g} com notas de botao a menos de {GESTO_CLEAR_FRAMES}: {near}")
-        if gestos and gestos[0] < GESTO_FIRST_FRAME:
-            erros.append(f"primeiro gesto em {gestos[0]} < {GESTO_FIRST_FRAME}")
-        for a, b in zip(gestos, gestos[1:]):
-            if b - a < GESTO_MIN_GAP_FRAMES:
-                erros.append(f"gestos {a} e {b} a {b - a} < {GESTO_MIN_GAP_FRAMES} quadros")
-        if not gestos:
-            erros.append("nenhum gesto")
+        gestos = [f for f, v in enumerate(rom) if v & 0x10]
+        if gestos:
+            erros.append(f"bit 4 (gesto) presente em {len(gestos)} quadros: {gestos[:5]}")
+        if any(v & ~0x0F for v in rom):
+            erros.append("bits acima do 3 em uso")
+        if not botoes:
+            erros.append("nenhuma nota de botao")
+        for b in botoes:
+            if b + _LANE_SLOT_SPAN + 1 >= total:
+                erros.append(f"nota em {b} nao e julgada antes do fim (frame + 153 >= {total})")
 
         # Metronomo
         periodo, fase = vh.get(("PERIODO", slot)), vh.get(("FASE", slot))
@@ -143,7 +133,7 @@ def main():
                     f"({fase / FRAME_CYCLES:.2f} quadros), PERIODO2 {periodo2}, NTROCA {ntroca}{troca}, "
                     f"{n_beats} tempos, deriva contra o MIDI real {deriva:.4f} quadros")
 
-        print(f"{nome}: {total} quadros, {len(botoes)} notas de botao, {len(gestos)} gestos {gestos}")
+        print(f"{nome}: {total} quadros, {len(botoes)} notas de botao, {len(gestos)} gestos")
         print(f"    metronomo: {info}")
         for a in avisos:
             print(f"    AVISO: {a}")

@@ -13,15 +13,14 @@
  *     3. Pagina 1: botao 1 liga o perfil sensorial e NAO mexe no eq;
  *        botao 0 liga o metronomo (modo 1); botao 2 liga o sem som
  *     4. Novo gesto (apos rearmar, mao fora) volta a pagina 0
- *   Nota de gesto (PLAY, musica 0, o frame_counter e posicionado perto
- *   dos gestos do chart):
- *     5. Mao a 15 cm segurada ANTES da nota nascer: nao conta erro
- *        (bad_press ignorado: misses 0, score 0)
- *     6. Gesto dentro da janela: acerto de gesto (+100, combo 1,
- *        apresentados 1, acertados 1); metricas de trilha intocadas
- *     7. Mao a 40 cm (fora da faixa) no 2o gesto: nada acontece ate a
- *        nota escapar: miss, combo 0, apresentados 2, acertados 1
- *     8. Contadores zeram ao voltar ao COUNTDOWN
+ *   Barra de energia e x2 integrados (PLAY, musica 0, eco HC-SR04):
+ *     5. Sem eco (0 cm) e fora da faixa (40 cm): nao somam energia,
+ *        nao contam movimento e nao geram erro; acerto normal soma 100+combo
+ *     6. Mao parada a 15 cm soma so presenca (0 movimentos); vai-e-vem
+ *        10 <-> 20 cm enche ate 255, conta movimentos e ativa x2_ativo
+ *     7. Com x2_ativo = 1, acertos de botao somam 2 * (100 + combo)
+ *     8. PAUSE congela energia/x2/movimentos; fim dos 480 quadros desliga
+ *        o x2 com energia = 0; voltar ao COUNTDOWN zera os contadores
  *-----------------------------------------------------------------------
  */
 `timescale 1ns/1ps
@@ -32,13 +31,16 @@ module tb_fd;
     reg  [4:0] botoes_raw = 5'b0;
     reg        echo = 0;
 
-    wire [3:0] s_jogada;
-    wire       jogada_feita, start_pulso, fim_contagem, fim_tempo, perdeu, song_ok;
-    wire       registraR, limpaR, zera_timer, conta_timer, game_active;
-    wire [3:0] db_estado;
-    wire       trig, servo;
-    wire [7:0]  eq_out, dist_cm, gesto_age, gestos_apres, gestos_acertos, misses, combo;
-    wire [15:0] score, met_n;
+    wire [3:0]  s_jogada;
+    wire        jogada_feita, start_pulso, fim_contagem, fim_tempo, perdeu, song_ok;
+    wire        registraR, limpaR, zera_timer, conta_timer, game_active;
+    wire [3:0]  db_estado;
+    wire        trig, servo;
+    wire [7:0]  t0n0, t1n0, t2n0, t3n0;
+    wire [7:0]  eq_out, dist_cm, energia, misses, combo;
+    wire        x2_ativo;
+    wire [6:0]  ativacoes;
+    wire [15:0] movimentos, score, met_n;
     wire [47:0] met_notas;
     wire [2:0]  progresso;
     wire        pagina, sem_som, sensorial;
@@ -52,10 +54,13 @@ module tb_fd;
         .hcsr04_echo(echo), .hcsr04_trig(trig), .servo_pwm(servo),
         .s_jogada(s_jogada), .jogada_feita(jogada_feita), .start_pulso(start_pulso),
         .fim_contagem(fim_contagem), .fim_tempo(fim_tempo), .perdeu(perdeu),
-        .song_ok_pulso(song_ok), .eq_out(eq_out), .score(score), .misses(misses),
+        .song_ok_pulso(song_ok),
+        .t0n0(t0n0), .t1n0(t1n0), .t2n0(t2n0), .t3n0(t3n0),
+        .eq_out(eq_out), .score(score), .misses(misses),
         .combo(combo), .met_n(met_n), .met_notas(met_notas),
-        .dist_cm_out(dist_cm), .gesto_age(gesto_age), .gestos_apres(gestos_apres),
-        .gestos_acertos(gestos_acertos), .progresso_out(progresso), .pagina_out(pagina),
+        .dist_cm_out(dist_cm), .energia_out(energia), .x2_ativo_out(x2_ativo),
+        .ativacoes_out(ativacoes), .movimentos_out(movimentos),
+        .progresso_out(progresso), .pagina_out(pagina),
         .sem_som_out(sem_som), .sensorial_out(sensorial), .modo_met_out(modo_met)
     );
 
@@ -92,7 +97,7 @@ module tb_fd;
 
     task confere;
         input            cond;
-        input [8*56-1:0] nome;
+        input [8*68-1:0] nome;
         begin
             if (cond) $display("[OK]   %0s", nome);
             else begin
@@ -125,27 +130,50 @@ module tb_fd;
         begin repeat (n) #3_000_000; end
     endtask
 
-    // Posiciona o frame_counter (so por simulacao) e espera ele chegar em alvo
-    task vai_para;
-        input integer f;
+    // Espera a proxima nota (em qualquer slot 0..2) chegar ao centro da janela
+    // (age 130), captura score/combo imediatamente antes do aperto e acerta
+    function tem_130;
+        input [7:0] n0, n1, n2;
         begin
-            @(negedge clock);
-            ufdt.frame_counter = f;
+            tem_130 = (n0 == 8'd130) || (n1 == 8'd130) || (n2 == 8'd130);
+        end
+    endfunction
+
+    function na_janela_centro;
+        input [7:0] n0, n1, n2;
+        begin
+            na_janela_centro = (n0 >= 8'd128 && n0 <= 8'd132) ||
+                               (n1 >= 8'd128 && n1 <= 8'd132) ||
+                               (n2 >= 8'd128 && n2 <= 8'd132);
+        end
+    endfunction
+
+    integer score_antes, combo_antes, x2_antes;
+    task acerta_proxima_nota;
+        integer tr;
+        begin
+            while (!tem_130(ufdt.t0n0, ufdt.t0n1, ufdt.t0n2) &&
+                   !tem_130(ufdt.t1n0, ufdt.t1n1, ufdt.t1n2) &&
+                   !tem_130(ufdt.t2n0, ufdt.t2n1, ufdt.t2n2) &&
+                   !tem_130(ufdt.t3n0, ufdt.t3n1, ufdt.t3n2))
+                @(posedge clock);
+            // Evita coincidir exatamente com o pulso frame_tick
+            repeat (4) @(posedge clock);
+            score_antes = score;
+            combo_antes = combo;
+            x2_antes    = x2_ativo;
+            if      (na_janela_centro(ufdt.t0n0, ufdt.t0n1, ufdt.t0n2)) tr = 0;
+            else if (na_janela_centro(ufdt.t1n0, ufdt.t1n1, ufdt.t1n2)) tr = 1;
+            else if (na_janela_centro(ufdt.t2n0, ufdt.t2n1, ufdt.t2n2)) tr = 2;
+            else                                                        tr = 3;
+            aperta(tr);
         end
     endtask
 
-    task espera_frame;
-        input integer f;
-        begin
-            while (ufdt.frame_counter < f) @(posedge clock);
-            #1;
-        end
-    endtask
-
-    integer eq_ant, miss0;
+    integer eq_ant, k, e_pausa, m_pausa, a_pausa, q_espera;
 
     initial begin
-        $display("=== TB fluxo_dados: gesto, paginas e metronomo ===");
+        $display("=== TB fluxo_dados: paginas, metronomo, energia e x2 ===");
 
         repeat (4) @(posedge clock);
         reset = 0;
@@ -181,7 +209,7 @@ module tb_fd;
         aperta(1);
         confere(eq_out != eq_ant && sensorial, "4b. pagina 0: eq responde; registradores da pagina 1 mantidos");
 
-        // ---- Jogo ----
+        // ---- Jogo: barra de energia e x2 ----
         aperta(4);                    // SETTINGS -> IDLE
         aperta(4);                    // IDLE -> SELECT
         confere(db_estado == 4'd6, "5a. SELECT");
@@ -189,43 +217,79 @@ module tb_fd;
         confere(db_estado == 4'd1, "5b. COUNTDOWN");
         while (db_estado != 4'd2) @(posedge clock);
         #1;
-        confere(gestos_apres == 0 && gestos_acertos == 0, "5c. contadores de gesto zerados no PLAY");
+        confere(energia == 0 && !x2_ativo && ativacoes == 0 && movimentos == 0,
+                "5c. energia, x2, ativacoes e movimentos zerados ao entrar no PLAY");
 
-        // Mao a 15 cm desde antes da nota nascer (gesto 1 do chart no quadro 1178)
+        // Sem eco (0 cm) e fora da faixa (40 cm) antes da 1a nota (age 130 no quadro ~143)
+        mao(0);  leituras(3);
+        mao(40); leituras(3);
+        confere(energia == 0 && movimentos == 0 && misses == 0,
+                "5d. sem eco e 40 cm ignorados, sem erro");
+
+        // Acertos normais (sem x2): 100 + combo
+        acerta_proxima_nota;
+        confere(!x2_antes && score == score_antes + 100 + combo_antes && combo == combo_antes + 1,
+                "5e. 1o acerto sem x2 soma 100 + combo");
+        acerta_proxima_nota;
+        confere(!x2_antes && combo_antes >= 1 && score == score_antes + 100 + combo_antes,
+                "5f. 2o acerto seguido sem x2 soma 100 + combo");
+
+        // Mao parada a 15 cm: soma presenca (+1/leitura), 0 movimentos
         mao(15);
-        vai_para(1168);
-        espera_frame(1176);
-        leituras(3);
-        confere(misses == 0 && score == 0 && combo == 0, "5d. mao na faixa sem nota: nenhum erro (bad_press ignorado)");
-        espera_frame(1178 + 20);
-        confere(gesto_age != 8'hFF && gesto_age > 8'd10 && gesto_age < 8'd30, "6a. nota de gesto nasce (bit 4 da ROM), age ~20");
-        espera_frame(1178 + 150);
-        confere(gestos_acertos == 1 && gestos_apres == 1, "6b. gesto acertado: apresentados 1, acertados 1");
-        confere(score == 16'd100 && combo == 8'd1 && misses == 0, "6c. +100, combo 1, sem miss");
-        confere(met_n == 0 && met_notas == 0, "6d. metricas de trilha intocadas");
-        confere(gesto_age == 8'hFF, "6e. slot de gesto livre depois do acerto");
+        leituras(6);
+        confere(energia >= 8'd4 && movimentos == 16'd0 && !x2_ativo,
+                "6a. mao parada a 15 cm enche barra sem contar movimentos");
 
-        // 2o gesto do chart (quadro 1795) com a mao fora da faixa (40 cm)
-        mao(40);
-        leituras(2);
-        vai_para(1787);
-        espera_frame(1795 + 140);
-        miss0 = misses;   // as 2 notas de botao do trecho anterior ja escaparam (nao ha jogador)
-        confere(gestos_acertos == 1 && gestos_apres == 1, "7a. mao a 40 cm: nada acontece na janela");
-        espera_frame(1795 + 156);
-        confere(gestos_apres == 2 && gestos_acertos == 1, "7b. escape conta como apresentado, nao como acerto");
-        confere(misses == miss0 + 1 && combo == 0 && score == 16'd100, "7c. escape: miss, combo zera, score igual");
+        // Vai-e-vem 10 <-> 20 cm ate encher (255) e ligar x2_ativo
+        k = 0;
+        while (!x2_ativo && k < 120) begin
+            mao((k % 2 == 0) ? 10 : 20);
+            leituras(1);
+            k = k + 1;
+        end
+        confere(x2_ativo && ativacoes == 7'd1 && movimentos >= 16'd70,
+                "6b. vai-e-vem 10<->20 cm ativa x2_ativo (ativacoes=1)");
 
-        // Fim: PAUSE congela, voltar ao COUNTDOWN zera
+        // Acertos durante x2_ativo: pontuacao em dobro 2 * (100 + combo)
+        mao(0);
+        acerta_proxima_nota;
+        confere(x2_antes && score == score_antes + 2 * (100 + combo_antes),
+                "7a. 1o acerto com x2_ativo soma 2*(100 + combo)");
+        acerta_proxima_nota;
+        confere(x2_antes && combo_antes >= 1 && score == score_antes + 2 * (100 + combo_antes),
+                "7b. 2o acerto com x2_ativo e combo>=1 soma 2*(100 + combo)");
+
+        // PAUSE congela energia, x2 e movimentos mesmo com eco variando
         aperta(4);                    // PLAY -> PAUSE
         confere(db_estado == 4'd3, "8a. PAUSE");
+        e_pausa = energia;
+        m_pausa = movimentos;
+        a_pausa = ativacoes;
+        mao(10); leituras(2);
+        mao(20); leituras(2);
+        mao(0);  leituras(1);
+        confere(energia == e_pausa && movimentos == m_pausa && ativacoes == a_pausa && x2_ativo,
+                "8b. PAUSE congela esvaziamento do x2 e movimentos");
+
+        // Retoma PLAY e espera terminar os 480 quadros do x2
         aperta(4);                    // PAUSE -> PLAY
+        q_espera = 0;
+        while (x2_ativo && q_espera < 600) begin
+            @(posedge ufdt.frame_tick);
+            #1;
+            q_espera = q_espera + 1;
+        end
+        confere(!x2_ativo && energia == 8'd0 && ativacoes == 7'd1,
+                "8c. x2 termina apos esvaziar ate 0; ativacoes permanece 1");
+
+        // Voltar ao COUNTDOWN zera todos os registradores de energia
         aperta(4);                    // PLAY -> PAUSE
         aperta(0);                    // PAUSE + botao -> IDLE
         aperta(4);                    // IDLE -> SELECT
         aperta(0);                    // -> COUNTDOWN
         repeat (4) @(posedge clock); #1;
-        confere(gestos_apres == 0 && gestos_acertos == 0, "8b. contadores zerados no COUNTDOWN");
+        confere(energia == 0 && !x2_ativo && ativacoes == 0 && movimentos == 0,
+                "8d. contadores de energia/x2/movimentos zerados no COUNTDOWN");
 
         $display("---");
         if (erros == 0)

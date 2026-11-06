@@ -135,10 +135,10 @@ module tb_baud_top;
         end
         confere(pkt[NPKT-1] == 8'hAA, "2. footer 0xAA no byte 55");
         confere((pkt[1] & 8'h0F) == 8'h00, "2. estado IDLE no byte 1");
-        confere(pkt[48] == 8'h00 && pkt[49] == 8'hFF && pkt[50] == 8'h00 && pkt[51] == 8'h00,
-                "2. sem eco, sem nota de gesto, contadores zerados (bytes 48-51)");
+        confere(pkt[48] == 8'h00 && pkt[49] == 8'h00 && pkt[50] == 8'h00 && pkt[51] == 8'h00,
+                "2. sem eco, energia, x2/ativacoes e mov_hi zerados (bytes 48-51)");
         confere(pkt[52] == 8'h00 && pkt[53] == 8'h03 && pkt[54] == 8'h00,
-                "2. config zerada e metronomo desligado (nivel 3) nos bytes 52-54");
+                "2. config zerada, metronomo desligado (nivel 3) e mov_lo 0 (bytes 52-54)");
         confere(pkt[45] == 8'h00 && pkt[46] == 8'h00 && pkt[47] == 8'h00,
                 "2. nome '---' com cursor 0 nos bytes 45-47");
 

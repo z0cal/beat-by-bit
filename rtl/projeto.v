@@ -79,8 +79,11 @@ module beat_by_bit #(
     wire [17:0] s_nome;
     wire [1:0]  s_nome_cursor;
 
-    // Gesto, configuracao "Jogo" e metronomo (FD -> packet_sender)
-    wire [7:0]  s_dist_cm, s_gesto_age, s_gestos_apres, s_gestos_acertos;
+    // Sensor, energia (x2), configuracao "Jogo" e metronomo (FD -> packet_sender)
+    wire [7:0]  s_dist_cm, s_energia;
+    wire        s_x2_ativo;
+    wire [6:0]  s_ativacoes;
+    wire [15:0] s_movimentos;
     wire [2:0]  s_progresso;
     wire        s_pagina, s_sem_som, s_sensorial, s_met_lado;
     wire [1:0]  s_modo_met, s_met_nivel;
@@ -156,9 +159,10 @@ module beat_by_bit #(
         .hcsr04_trig       (hcsr04_trig),
         .servo_pwm         (servo_pwm),
         .dist_cm_out       (s_dist_cm),
-        .gesto_age         (s_gesto_age),
-        .gestos_apres      (s_gestos_apres),
-        .gestos_acertos    (s_gestos_acertos),
+        .energia_out       (s_energia),
+        .x2_ativo_out      (s_x2_ativo),
+        .ativacoes_out     (s_ativacoes),
+        .movimentos_out    (s_movimentos),
         .progresso_out     (s_progresso),
         .pagina_out        (s_pagina),
         .sem_som_out       (s_sem_som),
@@ -197,9 +201,10 @@ module beat_by_bit #(
         .nome          (s_nome),
         .nome_cursor   (s_nome_cursor),
         .dist_cm       (s_dist_cm),
-        .gesto_age     (s_gesto_age),
-        .gestos_apres  (s_gestos_apres),
-        .gestos_acertos(s_gestos_acertos),
+        .energia       (s_energia),
+        .x2_ativo      (s_x2_ativo),
+        .ativacoes     (s_ativacoes),
+        .movimentos    (s_movimentos),
         .progresso     (s_progresso),
         .pagina        (s_pagina),
         .sem_som       (s_sem_som),

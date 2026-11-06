@@ -41,15 +41,15 @@
  *  [46]    {2'b00, c1}
  *  [47]    {2'b00, c2}
  *            caractere: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
- *  --- Semana 3: gesto e metronomo ---
+ *  --- Semana 3: sensor, energia (x2), configuracao e metronomo ---
  *  [48]    distancia do HC-SR04 em cm (saturada em 255; 0 = sem eco)
- *  [49]    age da nota de gesto (slot 0 da 5a trilha; 0xFF = nenhuma)
- *  [50]    gestos apresentados (julgados: acerto + escape)
- *  [51]    gestos acertados
+ *  [49]    energia (0..255; durante o x2 = tempo restante escalado)
+ *  [50]    {x2_ativo, ativacoes[6:0]} (ativacoes saturam em 127)
+ *  [51]    movimentos[15:8]
  *  [52]    {progresso[2:0], pagina, sem_som, sensorial, modo_met[1:0]}
  *            pagina 0 = atenuador, 1 = jogo; progresso = gesto de confirmacao
  *  [53]    {5'b0, lado, nivel[1:0]}  metronomo (nivel 0=60, 1=30, 2=15, 3=parado)
- *  [54]    0x00 reservado
+ *  [54]    movimentos[7:0]
  *  [55]    0xAA          marcador de fim
  *-----------------------------------------------------------------------
  */
@@ -98,11 +98,12 @@ module packet_sender #(
     input  wire [17:0] nome,
     input  wire [1:0]  nome_cursor,
 
-    // Gesto, configuracao e metronomo (Semana 3)
+    // Sensor, barra de energia (x2), configuracao e metronomo (Semana 3)
     input  wire [7:0]  dist_cm,
-    input  wire [7:0]  gesto_age,
-    input  wire [7:0]  gestos_apres,
-    input  wire [7:0]  gestos_acertos,
+    input  wire [7:0]  energia,
+    input  wire        x2_ativo,
+    input  wire [6:0]  ativacoes,
+    input  wire [15:0] movimentos,
     input  wire [2:0]  progresso,
     input  wire        pagina,
     input  wire        sem_som,
@@ -197,12 +198,12 @@ module packet_sender #(
                         pkt[46] <= {2'b00, nome[11:6]};
                         pkt[47] <= {2'b00, nome[17:12]};
                         pkt[48] <= dist_cm;
-                        pkt[49] <= gesto_age;
-                        pkt[50] <= gestos_apres;
-                        pkt[51] <= gestos_acertos;
+                        pkt[49] <= energia;
+                        pkt[50] <= {x2_ativo, ativacoes};
+                        pkt[51] <= movimentos[15:8];
                         pkt[52] <= {progresso, pagina, sem_som, sensorial, modo_met};
                         pkt[53] <= {5'b0, met_lado, met_nivel};
-                        pkt[54] <= 8'h00;
+                        pkt[54] <= movimentos[7:0];
                         pkt[55] <= 8'hAA;
                         byte_idx <= 0;
                         state    <= LOAD;

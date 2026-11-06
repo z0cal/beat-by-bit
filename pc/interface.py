@@ -57,7 +57,8 @@ import pygame
 
 # Tamanho do buffer de audio.
 # Maior buffer = menos crackling em maquinas lentas, mas mais latencia.
-# 4096 @ 44100Hz ≈ 93ms ≈ 6 frames a 60fps — compensado no chart (AUDIO_LATENCY_FRAMES).
+# 4096 @ 44100Hz ≈ 92,9 ms: compensado no inicio da musica (AUDIO_BUFFER_S, ver
+# Renderer._play_music), nao no chart (CHART_LEAD_FRAMES).
 _AUDIO_BUFFER = 4096
 # Passos que a simulacao recupera de uma vez (10 s). Recupera tudo para nao
 # perder a sincronia com o audio; acima disso (ex.: maquina suspensa) reancora.
@@ -94,9 +95,18 @@ except ImportError:
 
 SCREEN_W, SCREEN_H = 1800, 1080
 FPS = 60
-# Latencia do buffer de audio em frames: compensa o atraso entre pygame.music.play()
-# e o som efetivamente sair pelos alto-falantes.
-AUDIO_LATENCY_FRAMES = round(_AUDIO_BUFFER / 44100 * FPS)  # ≈ 6 frames
+# Antecedencia FIXA do chart (ROM da FPGA), independente do hardware de audio do PC:
+# o som do instante t (s) da musica deve sair quando a nota chega ao alvo, no quadro
+# t*60 + CHART_LEAD_FRAMES contado a partir do quadro 0 do PLAY (quadro em que a nota
+# do chart[0] nasce, age 0; frame_counter = 1 no primeiro pacote do PLAY). A nota do
+# chart[f] chega ao alvo (age HIT_AGE) no quadro f + HIT_AGE, entao
+#   f = round(t*60) - HIT_AGE + CHART_LEAD_FRAMES.
+# O PC cumpre a promessa iniciando o WAV adiantado (play com pos calculado); a folga
+# de 6 quadros (100 ms) e o tempo que o PC tem para isso e e igual ao buffer de audio
+# nominal, mas nao depende dele.
+CHART_LEAD_FRAMES = 6
+# Latencia real do buffer do mixer (float, s): entre play() e o som sair.
+AUDIO_BUFFER_S = _AUDIO_BUFFER / 44100
 
 # ─── Fatores de escala (base = 800×600) ──────────────────────────────────────
 _BASE_W, _BASE_H = 800, 600
@@ -330,6 +340,9 @@ class SerialReader(threading.Thread):
         self.baudrate = baudrate
         self.buf_lock = threading.Lock()
         self._buf = bytearray()
+        # Carimbo de chegada: (posicao absoluta do fim do trecho, perf_counter) por leitura
+        self._total = 0
+        self._stamps = []
         self._stop_evt = threading.Event()
         self._ack = threading.Event()
         self.connected = False
@@ -355,8 +368,11 @@ class SerialReader(threading.Thread):
                 # read(n>=1) bloqueia ate o timeout (50ms) em vez de girar a CPU em loop
                 data = ser.read(max(1, ser.in_waiting))
                 if data:
+                    t = time.perf_counter()
                     with self.buf_lock:
                         self._buf.extend(data)
+                        self._total += len(data)
+                        self._stamps.append((self._total, t))
             except Exception as e:
                 print(f"[Serial] Erro: {e}")
                 self.connected = False
@@ -372,6 +388,15 @@ class SerialReader(threading.Thread):
             data = bytes(self._buf)
             self._buf.clear()
         return data
+
+    def read_stamped(self):
+        """Como read_buf, mas devolve tambem [(fim_abs, t_chegada)] dos trechos lidos."""
+        with self.buf_lock:
+            data = bytes(self._buf)
+            stamps = self._stamps
+            self._buf.clear()
+            self._stamps = []
+        return data, stamps
 
     def request_ack(self):
         """Pede um ACK para a FPGA (enviado pela thread serial, no maximo 1 a cada ACK_INTERVAL)."""
@@ -792,7 +817,7 @@ def bpm_params(song_config):
       periodo: duracao de um tempo = tempo_us * 50 (inteiro exato).
       fase: ciclos desde frame_counter = 0 (inicio do PLAY) ate o primeiro tempo
             CHEGAR a hit zone: tempo em t = 0 s do audio, que a nota correspondente
-            atinge o alvo em t*60 + AUDIO_LATENCY_FRAMES quadros (a nota e criada
+            atinge o alvo em t*60 + CHART_LEAD_FRAMES quadros (a nota e criada
             HIT_AGE quadros antes: ver _midi_to_chart). Quadro = FRAME_CYCLES ciclos.
     Retorna dict(periodo, fase, bpm, n_tempos, tempo_us).
     """
@@ -807,7 +832,7 @@ def bpm_params(song_config):
         periodo2 = t2 * (CLOCK_HZ // 1_000_000)
         ntroca = round(tk / tpb)
         nao_alinhado = tk % tpb != 0
-    fase = AUDIO_LATENCY_FRAMES * FRAME_CYCLES  # primeiro tempo em t = 0 s
+    fase = CHART_LEAD_FRAMES * FRAME_CYCLES  # primeiro tempo em t = 0 s
     fase %= periodo
     return {
         "periodo": periodo,
@@ -844,10 +869,10 @@ def write_bpm_params(songs=None, path=None):
         "// FASE_n    = ciclos desde frame_counter = 0 (inicio do PLAY) ate o primeiro",
         "//             tempo CHEGAR a hit zone. O primeiro tempo e o tick 0 do MIDI (t = 0",
         "//             s do audio); a nota correspondente seria criada HIT_AGE (130)",
-        "//             quadros antes e atinge o alvo em t*60 + AUDIO_LATENCY_FRAMES",
-        f"//             quadros (= {AUDIO_LATENCY_FRAMES} quadros aqui), igual ao deslocamento de",
+        "//             quadros antes e atinge o alvo em t*60 + CHART_LEAD_FRAMES",
+        f"//             quadros (= {CHART_LEAD_FRAMES} quadros aqui), igual ao deslocamento de",
         f"//             _midi_to_chart. Quadro = {FRAME_CYCLES} ciclos (M do frame_tick em",
-        "//             fluxo_dados.v). FASE_n = AUDIO_LATENCY_FRAMES * 833333, mod PERIODO_n.",
+        "//             fluxo_dados.v). FASE_n = CHART_LEAD_FRAMES * 833333, mod PERIODO_n.",
         "// O tempo k chega ao alvo em FASE_n + k * PERIODO_n ciclos apos o inicio do PLAY.",
         "//",
     ]
@@ -993,10 +1018,11 @@ def _midi_to_chart(song_config=None, save_hex=False):
         _midi_notes(song_config["midi"]), song_config.get("melody", []), duration
     )
 
-    # AUDIO_LATENCY_FRAMES compensa o atraso do buffer de audio: sem ele, as notas
-    # chegam na hit zone antes do som correspondente sair pelos alto-falantes.
+    # A nota de t chega ao alvo no quadro t*60 + CHART_LEAD_FRAMES (ver a constante).
+    # round() e nao int(): truncar atrasaria a media em -1/2 quadro. Em t*60 exatamente
+    # em .5 o round do Python e half-even (pares): estavel e determinista, erro 1/2 quadro.
     for n in cands:
-        n["frame"] = int(n["t"] * FPS) - int(HIT_AGE) + AUDIO_LATENCY_FRAMES
+        n["frame"] = round(n["t"] * FPS) - int(HIT_AGE) + CHART_LEAD_FRAMES
     # Toda nota precisa ser julgada (acerto ou perdida) antes do fim do chart,
     # senao fica sem jogar e fora das metricas: a nota perdida sai da tela com
     # age 152 (_LANE_SLOT_SPAN), e o jogo vai para o END no ultimo frame.
@@ -1163,7 +1189,7 @@ class SimulationEngine:
         except Exception as e:  # mido ausente ou MIDI sem tempo: 120 BPM
             print(f"[sim] metronomo: andamento padrao 120 BPM ({e})")
             per = 500_000 * (CLOCK_HZ // 1_000_000)
-            return per, AUDIO_LATENCY_FRAMES * FRAME_CYCLES % per, per, 0xFFFFFFFF
+            return per, CHART_LEAD_FRAMES * FRAME_CYCLES % per, per, 0xFFFFFFFF
 
     def _met_beats(self):
         """Tempos que ja chegaram ao alvo: tempo k chega em FASE + k*PERIODO (...PERIODO2)."""
@@ -1460,7 +1486,13 @@ class Renderer:
         # som externa). Positivo: a musica comeca adiantada esse tanto para
         # compensar; negativo: a musica comeca atrasada.
         self._audio_offset = audio_offset_ms / 1000.0
-        self._music_start_at = None  # perf_counter em que play() deve rodar
+        self._baudrate = baudrate
+        # perf_counter do quadro 0 do PLAY (nota do chart[0] nasce; frame_counter = 1).
+        # None fora do PLAY. Serial: estimativa, o MENOR valor visto (atrasos so
+        # aumentam); sim: relogio ideal da simulacao.
+        self._play_anchor = None
+        self._play_info = None  # ultimo play: pos pedido, ancora, instante (diagnostico)
+        self._music_prep_s = 0.015  # custo medido de cortar+carregar o WAV
         # Jogo sempre desenha em SCREEN_W x SCREEN_H (HIT_AGE depende disso);
         # _present() escala esse frame para a janela, que e redimensionavel.
         if scale is None:
@@ -1519,6 +1551,8 @@ class Renderer:
         self.scratch = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
 
         self._serial_buf = bytearray()
+        self._rx_base = 0  # posicao absoluta (bytes recebidos) de _serial_buf[0]
+        self._rx_stamps = []  # [(fim_abs, t_chegada)] ainda nao consumidos
         if sim_mode:
             self.sim = SimulationEngine()
             self.serial = None
@@ -1575,21 +1609,25 @@ class Renderer:
         path = SONGS[self._selected_song]["audio"]
 
         source = path
-        if preview or any(self._eq):
-            data = self._audio_cache.get(key)
-            if data is None:
-                try:
+        # Sempre em memoria (inclusive sem atenuador): _play_music corta o WAV nas amostras
+        data = self._audio_cache.get(key)
+        if data is None:
+            try:
+                if preview or any(self._eq):
                     data = _eq_wav_bytes(path, self._eq, EQ_PREVIEW_S if preview else None)
-                except Exception as e:
-                    print(f"[music] Atenuador indisponivel, tocando original: {e}")
-                if data is not None:
-                    if len(self._audio_cache) >= self._AUDIO_CACHE_MAX:
-                        self._audio_cache.pop(next(iter(self._audio_cache)))
-                    self._audio_cache[key] = data
+                else:
+                    with open(path, "rb") as f:
+                        data = f.read()
+            except Exception as e:
+                print(f"[music] Atenuador indisponivel, tocando original: {e}")
             if data is not None:
-                # O mixer le o arquivo aos poucos: a referencia precisa viver
-                self._music_buf = io.BytesIO(data)
-                source = self._music_buf
+                if len(self._audio_cache) >= self._AUDIO_CACHE_MAX:
+                    self._audio_cache.pop(next(iter(self._audio_cache)))
+                self._audio_cache[key] = data
+        if data is not None:
+            # O mixer le o arquivo aos poucos: a referencia precisa viver
+            self._music_buf = io.BytesIO(data)
+            source = self._music_buf
 
         try:
             if source is path:
@@ -1630,18 +1668,7 @@ class Renderer:
                     pygame.mixer.music.unpause()  # retoma de onde parou
                     self._music_paused = False
                 elif not self._music_started:
-                    if self._audio_offset >= 0:
-                        # inicia do zero, pulando o trecho que a latencia atrasaria
-                        pygame.mixer.music.play(start=self._audio_offset)
-                        self._music_started = True
-                    else:
-                        now = time.perf_counter()
-                        if self._music_start_at is None:
-                            self._music_start_at = now - self._audio_offset
-                        if now >= self._music_start_at:
-                            pygame.mixer.music.play()
-                            self._music_start_at = None
-                            self._music_started = True
+                    self._play_music()
         elif state == STATE_PAUSE:
             if playing:
                 pygame.mixer.music.pause()
@@ -1652,7 +1679,77 @@ class Renderer:
                 pygame.mixer.music.stop()
             self._music_paused = False
             self._music_started = False
-            self._music_start_at = None
+
+    def _play_music(self):
+        """
+        Inicia a musica do zero, ancorada no quadro 0 do PLAY. Roda a cada quadro ate
+        a musica comecar (ainda sem ancora, ou pos < 0: espera). O som do instante t da
+        musica deve sair em ancora + t + CHART_LEAD_FRAMES/FPS; play() so o faz sair
+        AUDIO_BUFFER_S depois, e --audio-offset adianta mais. Logo, chamando play() no
+        instante T com a musica comecando em pos:
+            pos(T) = (T - ancora) - CHART_LEAD_FRAMES/FPS + AUDIO_BUFFER_S + audio_offset.
+        """
+        anchor = self._play_anchor
+        if anchor is None:
+            return
+        lead = CHART_LEAD_FRAMES / FPS - AUDIO_BUFFER_S - self._audio_offset
+        t_zero = anchor + lead  # instante em que play() com pos = 0 e o certo
+        for _ in range(3):
+            now = time.perf_counter()
+            if t_zero - now > self._music_prep_s + 0.002:
+                return  # ainda cedo: agenda para um quadro futuro
+            # WAV so aceita start em segundos inteiros no SDL_mixer: o corte e feito
+            # nas amostras e o stream carregado ja comeca em pos.
+            t_call = max(now + self._music_prep_s, t_zero)
+            pos = max(0.0, t_call - t_zero)
+            if not self._load_from(pos):
+                self._music_started = True  # sem audio: nao tenta de novo
+                return
+            wait = t_call - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            elif wait < -0.002 and pos > 0:
+                # atrasou: o corte ja nao vale, refaz com o custo real
+                self._music_prep_s = min(0.1, -wait + self._music_prep_s + 0.003)
+                continue
+            self._music_prep_s = max(0.003, min(0.1, (time.perf_counter() - now) * 1.3))
+            break
+        t_play = time.perf_counter()
+        self._play_info = {"pos": pos, "anchor": anchor, "t": t_play, "t_zero": t_zero}
+        pygame.mixer.music.play()
+        self._music_started = True
+
+    def _load_from(self, pos):
+        """Carrega no mixer a musica atual a partir de pos segundos. False se falhar."""
+        data = self._audio_cache.get((self._selected_song, tuple(self._eq), False))
+        if data is None:
+            try:
+                with open(SONGS[self._selected_song]["audio"], "rb") as f:
+                    data = f.read()
+            except OSError:
+                return False
+        try:
+            with wave.open(io.BytesIO(data), "rb") as w:
+                rate = w.getframerate()
+                w.setpos(min(w.getnframes(), int(round(pos * rate))))
+                pcm = w.readframes(w.getnframes())
+                ch, width = w.getnchannels(), w.getsampwidth()
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(ch)
+                w.setsampwidth(width)
+                w.setframerate(rate)
+                w.writeframes(pcm)
+            self._music_buf = io.BytesIO(buf.getvalue())
+            pygame.mixer.music.load(self._music_buf, "wav")
+            pygame.mixer.music.set_volume(self._music_volume())
+        except Exception as e:
+            print(f"[music] Falha ao cortar/carregar musica: {e}")
+            return False
+        # o stream do mixer agora e o trecho cortado: recarrega a musica inteira
+        # na proxima vez que sair do PLAY
+        self._loaded_audio = None
+        return True
 
     # ── Pre-renderizacao ──────────────────────────────────────────────────────
 
@@ -1843,20 +1940,42 @@ class Renderer:
 
     def _process_serial(self):
         """Drena o buffer serial e atualiza o estado da FPGA."""
-        new_data = self.serial.read_buf()
+        new_data, stamps = self.serial.read_stamped()
         if new_data:
             self._serial_buf.extend(new_data)
+            self._rx_stamps.extend(stamps)
 
         while len(self._serial_buf) >= PACKET_SIZE:
             pkt, consumed = find_packet(self._serial_buf)
             self._serial_buf = self._serial_buf[consumed:]
+            self._rx_base += consumed
             if pkt is None:
                 break
             self.serial.request_ack()
-            self._apply_pkt(pkt)
+            # Chegada do ultimo byte do pacote (primeiro carimbo que o cobre) menos o
+            # tempo de transmissao do pacote (10 bits por byte na UART 8N1).
+            t_pkt = None
+            for end_abs, t in self._rx_stamps:
+                if end_abs >= self._rx_base:
+                    t_pkt = t - PACKET_SIZE * 10 / self._baudrate
+                    break
+            self._rx_stamps = [x for x in self._rx_stamps if x[0] >= self._rx_base]
+            self._apply_pkt(pkt, t_pkt)
 
-    def _apply_pkt(self, pkt):
-        """Copia um pacote (FPGA ou simulacao) para o estado da interface."""
+    def _apply_pkt(self, pkt, t_pkt=None):
+        """
+        Copia um pacote (FPGA ou simulacao) para o estado da interface.
+        t_pkt: instante (perf_counter) em que o estado do pacote foi produzido (serial:
+        chegada - transmissao; sim: instante ideal do passo). Alimenta _play_anchor.
+        """
+        if pkt["state"] not in (STATE_PLAY, STATE_PAUSE):
+            self._play_anchor = None
+        elif pkt["state"] == STATE_PLAY and t_pkt is not None and pkt["frame_counter"] >= 1:
+            # Com frame_counter = k o pacote vem k-1 quadros depois do quadro 0 do PLAY
+            # (a nota do chart[0] nasce no passo que leva o contador a 1).
+            est = t_pkt - (pkt["frame_counter"] - 1) / FPS
+            if self._play_anchor is None or est < self._play_anchor:
+                self._play_anchor = est
         self._prev_notes = [list(t) for t in self.fpga_notes]
         self._prev_score = self.fpga_score
         self._prev_combo = self.fpga_combo
@@ -1961,7 +2080,8 @@ class Renderer:
         pkt = self.sim.step(self._sim_btn, self._sim_mao)
         self._sim_btn = [False] * 5
         self._sim_steps += due
-        self._apply_pkt(pkt)
+        # O passo de numero n (contado de 1) tem instante ideal t0 + n/FPS
+        self._apply_pkt(pkt, self._sim_t0 + self._sim_steps / FPS)
 
     # ── Sessao: fecha ao fim da musica ────────────────────────────────────────
 

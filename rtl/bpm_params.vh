@@ -16,10 +16,10 @@
 // FASE_n    = ciclos desde frame_counter = 0 (inicio do PLAY) ate o primeiro
 //             tempo CHEGAR a hit zone. O primeiro tempo e o tick 0 do MIDI (t = 0
 //             s do audio); a nota correspondente seria criada HIT_AGE (130)
-//             quadros antes e atinge o alvo em t*60 + AUDIO_LATENCY_FRAMES
+//             quadros antes e atinge o alvo em t*60 + CHART_LEAD_FRAMES
 //             quadros (= 6 quadros aqui), igual ao deslocamento de
 //             _midi_to_chart. Quadro = 833333 ciclos (M do frame_tick em
-//             fluxo_dados.v). FASE_n = AUDIO_LATENCY_FRAMES * 833333, mod PERIODO_n.
+//             fluxo_dados.v). FASE_n = CHART_LEAD_FRAMES * 833333, mod PERIODO_n.
 // O tempo k chega ao alvo em FASE_n + k * PERIODO_n ciclos apos o inicio do PLAY.
 //
 // slot 0: Concerning Hobbits, 105.000 BPM

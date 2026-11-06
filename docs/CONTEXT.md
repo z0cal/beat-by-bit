@@ -96,9 +96,32 @@ Charts `.hex` gerados automaticamente em `rtl/` no startup do SimulationEngine: 
 - No `--sim`, a simulação avança pelo relógio de parede (`time.perf_counter`), 1 passo a cada
   1/60 s, como o `frame_tick` da FPGA. Não conta frames renderizados: `clock.tick(60)` roda a
   ~59 fps e as notas atrasavam ~1 s ao fim da música.
+- **Modelo (desde 05/11/2026):** o som do instante `t` da música deve sair quando a nota chega ao
+  alvo, no quadro `t*60 + CHART_LEAD_FRAMES` (= 6) contado do **quadro 0 do PLAY** (o passo em que
+  a nota do `chart[0]` nasce, `frame_counter = 1` no primeiro pacote do PLAY). O chart usa
+  `frame = round(t*60) - HIT_AGE + CHART_LEAD_FRAMES`; a antecedência é fixa, independe do buffer
+  de áudio do PC e vale igual para a ROM da FPGA. `round()` do Python é half-even: em `t*60`
+  exatamente em .5 (7 notas candidatas nas 4 músicas) vai para o quadro par; é estável, erro de
+  meio quadro. O antigo `int()` truncava (média −½ quadro).
+- **Início da música ancorado:** `Renderer._play_anchor` = instante (perf_counter) do quadro 0 do
+  PLAY. `--sim`: instante ideal do passo (`_sim_t0 + n/FPS`) − (frame_counter−1)/FPS. Serial: a
+  `SerialReader` carimba a chegada de cada leitura; âncora = chegada do pacote − 56·10/baud −
+  (frame_counter−1)/FPS, com o **mínimo** visto desde a entrada em PLAY (atrasos só aumentam a
+  estimativa). `_play_music` chama `play()` no instante T com a música começando em
+  `pos = (T − âncora) − CHART_LEAD_FRAMES/FPS + AUDIO_BUFFER_S + audio_offset` (AUDIO_BUFFER_S =
+  4096/44100 = 92,9 ms, a latência real do mixer). Se `pos < 0` espera até 0. Pause/unpause
+  não mudam.
+- **`play(start=…)` NÃO serve para WAV** neste pygame 2.6.1/SDL 2.28.4: o `start` é truncado para
+  segundos inteiros (verificado com `SDL_AUDIODRIVER=disk`: `start=3.9` toca de 3,0 s). Por isso
+  `_load_from` corta o WAV pelo número de amostras, recarrega o stream já recortado e chama
+  `play()` sem `start`. O WAV fica sempre em memória (cache de `_load_audio`); depois de tocar,
+  `_loaded_audio = None` força recarregar a música inteira ao sair do PLAY.
 - `--audio-offset MS` compensa latência extra da saída de áudio (ex.: 200 para fone Bluetooth;
-  negativo se as notas chegam depois do som). O buffer do mixer já é compensado no chart por
-  `AUDIO_LATENCY_FRAMES`.
+  positivo = música adiantada, negativo = atrasada). Latência da tela (vsync) também entra aqui.
+- **Medir:** `uv run python pc/medir_sync.py` — (a) erro nota×som do `.hex` contra os onsets do
+  MIDI (mediana/p90), (b) Renderer `--sim` headless: pos pedido ao `play`, erro do pos e tempo de
+  quadro, (c) confere no motor que a nota chega a age 130 no passo f+130 depois de fc=1.
+  Rode antes/depois de qualquer mudança em chart, áudio ou loop.
 
 ---
 
@@ -107,8 +130,8 @@ Charts `.hex` gerados automaticamente em `rtl/` no startup do SimulationEngine: 
 ```
 linhas 28-35   : _AUDIO_BUFFER=16384 + pygame.mixer.pre_init(44100,-16,2,_AUDIO_BUFFER) + pygame.init()
                  pre_init ANTES de pygame.init() — evita double-init
-linhas 52-55   : FPS=60, AUDIO_LATENCY_FRAMES=round(_AUDIO_BUFFER/44100*FPS) ≈ 22
-                 Compensa latencia do buffer: notas spawnam AUDIO_LATENCY_FRAMES mais tarde
+linhas 52-55   : FPS=60, CHART_LEAD_FRAMES=6 (fixo), AUDIO_BUFFER_S=_AUDIO_BUFFER/44100
+                 Chart com antecedencia fixa; o buffer e compensado no pos do play (_play_music)
 linhas 56-74   : HIT_AGE = round(HIT_Y / NOTE_SPEED) = 130 (int)
 linhas 100-140 : SONG_DURATION_MS, ROM_DEPTH, SONGS[], PACKET_SIZE
 linhas 265-350 : _midi_to_chart(song_config=None, save_hex=False)
@@ -234,6 +257,7 @@ Registro do *porquê* de cada escolha; o *o quê* está nas seções acima.
 | Pinos: TRIG C16 (JP1-4), ECHO K20 (JP1-6), servo K22 (JP1-8) | Os da S1 (GPIO_0_D3/D5/D7). **Conferir no Pin Planner** antes de ligar |
 | Perfil sensorial = música a **50% (0,35)** + sem bursts/partículas/flash/pulsos; fica **um anel fino** no acerto | PERFIL_SENSORIAL sem violar LATENCIA_FEEDBACK (o retorno visual não pode sumir) |
 | Sem som = **volume 0**, a música continua tocando | Parar o mixer quebraria a sincronia chart × áudio e a prévia de 10 s |
+| **Sincronia: `CHART_LEAD_FRAMES = 6` fixo + `round()` + `play` por amostra ancorado no quadro 0 do PLAY** | Notas chegavam 8–33 ms antes do som (int() truncava, buffer 93 ms vs 100 ms, play no quadro em que o PC percebia o PLAY). Ver "Sincronia chart × áudio" |
 | Pacote **56 bytes** (≤ 64 do PACOTE_METRICAS), byte 54 reservado | Folga para o nível adaptativo/tempo por nível da S4 |
 
 Pendências que ficaram de fora: tempo por nível do metrônomo e modo adaptativo (S4), confirmação

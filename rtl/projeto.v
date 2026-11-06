@@ -36,7 +36,7 @@ module beat_by_bit #(
     output wire        uart_tx_out,  // TX serial para o PC (BAUD)
     input  wire        uart_rx_in,   // RX serial: ACK do PC (TXD do CP2102)
     output wire        hcsr04_trig,  // GPIO_0_D3: TRIG do HC-SR04
-    input  wire        hcsr04_echo,  // GPIO_0_D5: ECHO do HC-SR04 (5 V -> divisor de tensao!)
+    input  wire        hcsr04_echo,  // GPIO_0_D5: ECHO do HC-SR04 (sensor a 3,3 V: ECHO direto, sem divisor)
     output wire        servo_pwm     // GPIO_0_D7: sinal do servo do metronomo
 );
 

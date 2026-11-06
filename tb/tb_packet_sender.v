@@ -3,10 +3,11 @@
  * Modulo    : packet_sender (inclui uart_tx internamente)
  *-----------------------------------------------------------------------
  * Testa:
- *   1. Ao receber frame_tick, transmite os 49 bytes do pacote
+ *   1. Ao receber frame_tick, transmite os 56 bytes do pacote
  *   2. Sequencia correta dos bytes: 0x55, {eq, state}, {eq, countdown},
  *      notas, score_h, score_l, misses, combo, {song_id, frame_h},
- *      frame_l, metricas, nome do perfil, 0xAA
+ *      frame_l, metricas, nome do perfil, bytes 48-54 (dist, gesto,
+ *      config, metronomo), 0xAA no byte 55
  *   3. Niveis do atenuador nos nibbles altos dos bytes 1 e 2
  *   4. Metricas: soma_e negativa sai estendida em 24 bits; contadores
  *      de 12 bits empacotados em 3 bytes por trilha
@@ -23,7 +24,7 @@ module tb_packet_sender;
 
     localparam CLKS_PER_BIT = 4;
     localparam CLK_PERIOD   = 10;
-    localparam PACKET_SIZE  = 49;
+    localparam PACKET_SIZE  = 56;
 
     // DUT
     reg  clock      = 0;
@@ -56,6 +57,12 @@ module tb_packet_sender;
     reg [17:0] nome        = {6'd27, 6'd14, 6'd1};
     reg [1:0]  nome_cursor = 2'd2;
 
+    // Semana 3: gesto, configuracao e metronomo
+    reg [7:0]  dist_cm = 8'd15, gesto_age = 8'd77, gestos_apres = 8'd9, gestos_acertos = 8'd6;
+    reg [2:0]  progresso = 3'd5;
+    reg        pagina = 1'b1, sem_som = 1'b0, sensorial = 1'b1, met_lado = 1'b1;
+    reg [1:0]  modo_met = 2'd1, met_nivel = 2'd2;
+
     wire uart_tx_out;
 
     packet_sender #(.CLKS_PER_BIT(CLKS_PER_BIT)) dut (
@@ -83,6 +90,11 @@ module tb_packet_sender;
         .met_acertos  (met_acertos),
         .nome         (nome),
         .nome_cursor  (nome_cursor),
+        .dist_cm(dist_cm), .gesto_age(gesto_age),
+        .gestos_apres(gestos_apres), .gestos_acertos(gestos_acertos),
+        .progresso(progresso), .pagina(pagina), .sem_som(sem_som),
+        .sensorial(sensorial), .modo_met(modo_met),
+        .met_lado(met_lado), .met_nivel(met_nivel),
         .uart_tx_out  (uart_tx_out)
     );
 
@@ -174,7 +186,14 @@ module tb_packet_sender;
             expected[45] = {nome_cursor, nome[5:0]};
             expected[46] = {2'b00, nome[11:6]};
             expected[47] = {2'b00, nome[17:12]};
-            expected[48] = 8'hAA;
+            expected[48] = dist_cm;
+            expected[49] = gesto_age;
+            expected[50] = gestos_apres;
+            expected[51] = gestos_acertos;
+            expected[52] = {progresso, pagina, sem_som, sensorial, modo_met};
+            expected[53] = {5'b0, met_lado, met_nivel};
+            expected[54] = 8'h00;
+            expected[55] = 8'hAA;
         end
     endtask
 
@@ -214,6 +233,11 @@ module tb_packet_sender;
             $display("[FAIL] nome AN0 com cursor 2 deveria sair 81 0E 1B");
             erros = erros + 1;
         end
+        // Literais dos bytes novos: progresso 5, pagina 1, sensorial 1, modo 1
+        if (expected[52] !== 8'hB5 || expected[53] !== 8'h06 || expected[48] !== 8'd15) begin
+            $display("[FAIL] bytes 48/52/53 esperados 0F / B5 / 06");
+            erros = erros + 1;
+        end
         tick;
         check_packet("Pacote 1");
 
@@ -226,6 +250,8 @@ module tb_packet_sender;
         met_n         = 16'd7;
         nome          = 18'd0;
         nome_cursor   = 2'd0;
+        dist_cm = 8'd0; gesto_age = 8'hFF; progresso = 3'd0; pagina = 1'b0;
+        sem_som = 1'b1; sensorial = 1'b0; modo_met = 2'd0; met_lado = 1'b0; met_nivel = 2'd3;
         monta_esperado;
         tick;
         check_packet("Pacote 2");

@@ -10,7 +10,7 @@ Layout: `rtl/` (Verilog + Quartus + charts `.hex`), `tb/` (testbenches), `pc/` (
 
 ```
 FPGA (Verilog) ──UART 921600───► Python (Pygame)
-  projeto.v           (49 bytes/frame)    interface.py
+  projeto.v           (56 bytes/frame)    interface.py
   unidade_controle.v                      SimulationEngine (--sim)
   fluxo_dados.v
   packet_sender.v
@@ -144,7 +144,7 @@ linhas 230-255 : chart_spawn_r: mux de ROM baseado em song_id_reg
 
 ## Protocolo UART (FPGA → Python)
 
-Pacote de 49 bytes a 60fps, 921600 baud 8N1 (~0,53 ms de transmissão por quadro de 16,7 ms).
+Pacote de 56 bytes a 60fps, 921600 baud 8N1 (~0,53 ms de transmissão por quadro de 16,7 ms).
 A velocidade é o parâmetro `BAUD` do `projeto.v` (50 MHz / 921600 = 54 ciclos/bit → 925926 baud,
 +0,5%) e o `--baud` do PC (padrão 921600); os dois precisam bater. Para voltar a 115200:
 `BAUD = 115_200` e `--baud 115200`. **Não usar 1 Mbaud**: o CP2102 original só tem até 921600 na
@@ -173,8 +173,72 @@ pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados visto
 [45] = {cursor[1:0], c0[5:0]}   c0 = caractere da esquerda
 [46] = {2'b00, c1[5:0]}
 [47] = {2'b00, c2[5:0]}         código: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
-[48] = 0xAA (footer)
+--- semana 3: sensor, gesto, configuração e metrônomo ---
+[48] = distância do HC-SR04 em cm (satura em 255; 0 = sem eco/timeout)
+[49] = idade da nota de gesto (5ª trilha, slot 0; 0xFF = nenhuma)
+[50] = gestos apresentados (julgados: acerto + escape)
+[51] = gestos acertados
+[52] = {progresso[2:0], pagina, sem_som, sensorial, modo_met[1:0]}
+       modo_met 0 = desligado, 1 = fixo (2 = adaptativo, S4); pagina 0 = Som, 1 = Jogo;
+       progresso = gesto de confirmação 0..7
+[53] = {5'b0, lado, nivel[1:0]}  nivel 0 = 60°, 1 = 30°, 2 = 15°, 3 = parado
+[54] = 0x00 (reservado)
+[55] = 0xAA (footer)
 ```
+
+### Gesto, configurações e metrônomo (Semana 3)
+
+- **ROM de 5 bits**: bits [3:0] = trilhas, bit 4 = nota de gesto (sozinha no quadro, ≥ 600 quadros
+  entre gestos, 60 quadros livres em volta; 4 por música). Checar com `uv run python pc/verifica_charts.py`.
+- **Nota de gesto** (`fluxo_dados.v`): 5ª `note_track` com `btn_press = gesto_pulso` (uma leitura
+  do HC-SR04 com a mão entre 5 e 25 cm). Acerto = +100 + combo; escape = miss; mão fora da janela é
+  ignorada (`bad_press` descartado). Não entra em `metricas.v` (assincronia/trilhas).
+- **HC-SR04** (`hcsr04.v`): TRIG de 10 µs a cada 60 ms, ECHO sincronizado, cm = µs/58, timeout 25 ms.
+- **Gesto de confirmação** (`gesto_detector.v`, só em SETTINGS): 16 leituras seguidas na faixa
+  (~1 s) geram um pulso que troca a página; só rearma após 4 leituras fora. Evita disparo acidental.
+- **Configurações em 2 páginas** (`cfg_jogo.v` + `eq_config.v`): página Som = atenuador (D/F/J/K);
+  página Jogo = D metrônomo desligado/fixo, F perfil sensorial, J sem som (K reservado). Sem chaves SW.
+- **Metrônomo** (`metronomo.v` + `servo_pwm.v`): período e fase em ciclos de 50 MHz vindos de
+  `rtl/bpm_params.vh` (gerado por `gerar_hex.py`; suporta uma troca de andamento: Pokémon 192→136 BPM
+  no tempo 40). Braço ±30° no modo fixo, centro fora do PLAY/pausa/desligado. PWM 50 Hz, 1–2 ms.
+- **PC**: perfil sensorial = música a 50% e efeitos intensos desligados (fica um anel fino);
+  sem som = volume 0 (a música segue, o sync não muda). No `--sim`, **G** = mão no sensor.
+
+---
+
+## Decisões da Semana 3 (05/11/2026) — não reverter sem motivo
+
+Registro do *porquê* de cada escolha; o *o quê* está nas seções acima.
+
+| Decisão | Motivo |
+|---------|--------|
+| **Sem chaves SW.** Metrônomo, perfil sensorial e sem som são escolhidos na página "Jogo" da tela de configurações | As chaves são de difícil acesso na maquete; a S2 já tinha migrado a configuração para telas com os botões das trilhas. Substitui o SW0–SW3 da especificação (registrar como desvio) |
+| **HC-SR04 como entrada da tela de configurações**: segurar a mão entre 5 e 25 cm troca a página | Dá um "botão" extra sem fiação nova |
+| Gesto de confirmação exige **16 leituras seguidas na faixa (~1 s)**; uma leitura fora zera; rearma só após **4 leituras fora** | O sensor dispara fácil por acidente (mão passando, corpo da criança); segurar 1 s e ter de tirar a mão evita trocas repetidas |
+| Gesto de confirmação **só em SETTINGS**; em PLAY vale só a nota de gesto | Evita trocar configuração no meio da música |
+| Gesto troca **página**, não confirma valor; START continua sendo "salvar e voltar" | Mantém o modelo da S2; um disparo acidental só muda a aba exibida, nunca um ajuste |
+| Página "Jogo": D = metrônomo desligado↔fixo (adaptativo só na S4), F = sensorial, J = sem som, K reservado | Uma tecla por opção, sem menus; K livre para a janela configurável (opcional) |
+| Registradores de configuração **zeram só no reset** (como `eq_config`) | A configuração vale para várias crianças/sessões seguidas |
+| Nota de gesto = **5ª `note_track`** com a mesma física (idade, janela ±11, escape em 151) | Reuso do módulo testado; o aviso de 2,2 s sai de graça (130 quadros de queda) |
+| Gesto: acerto **+100 + combo** e conta no combo/maior combo; escape = **miss**; mão fora da janela é **ignorada** | Gesto é parte da música, mas o sensor não pode punir a criança por mexer a mão (`bad_press` descartado) |
+| Gesto **fora de `metricas.v`** (assincronia, notas/acertos por trilha) | A resolução do sensor (~60 ms por leitura) não serve para medir assincronia; o gesto tem contadores próprios no pacote |
+| **"Gestos apresentados" = julgados** (acerto + escape), não spawnados | A nota só "conta" quando sai; ao fim da música é igual ao total. O `--sim` segue a mesma regra |
+| Até **4 gestos por música**, ≥ 10 s entre gestos, 1 s sem notas de botão em volta, nenhum nos primeiros 10 s | ESPACAMENTO_GESTO; poucos gestos pela alternância botão↔mão (risco na especificação). Algumas notas de botão foram removidas (Condado 74→68, Pokémon 67→60) |
+| Bit 4 da ROM = gesto, **sozinho no quadro** | Simplifica o desenho (barra cobrindo as 4 trilhas) e o julgamento |
+| Andamento por música em `bpm_params.vh` com **um segundo segmento** (`PERIODO2`, `NTROCA`) | O MIDI do Pokémon muda de 192 para 136 BPM no tempo 40; com um só período o metrônomo saía ~20 s de fase. Mais de 2 andamentos: só os 2 primeiros (com aviso) |
+| `FASE` = instante em que o tempo **chega ao alvo**, não o spawn | O metrônomo tem de bater junto com a nota na hit zone |
+| Metrônomo **congela em PAUSE** e reinicia em IDLE/SELECT/COUNTDOWN | Não perde a fase com a pausa. Jitter de até 1 quadro na entrada do PLAY (não alinhado ao `frame_tick`), aceito |
+| Modo fixo = nível 0 = **±30°** (60° de excursão total) | Interpretação do "nível de 60°" do RETIRADA_METRONOMO; 30°/15° serão ±15°/±7,5° na S4 |
+| `bpm_params.vh` incluído com **`ifdef QUARTUS`** (`../../rtl/` vs `rtl/`) | Mesmo truque dos `$readmemh`; o `check` do iverilog não aceita `-I` |
+| HC-SR04 **alimentado a 3,3 V**, ECHO direto no GPIO, **sem divisor** | Ensaio da S1: com 3,3 V o eco não passa de 3,3 V (COMPATIBILIDADE_ELETRICA). Não ligar a 5 V |
+| Pinos: TRIG C16 (JP1-4), ECHO K20 (JP1-6), servo K22 (JP1-8) | Os da S1 (GPIO_0_D3/D5/D7). **Conferir no Pin Planner** antes de ligar |
+| Perfil sensorial = música a **50% (0,35)** + sem bursts/partículas/flash/pulsos; fica **um anel fino** no acerto | PERFIL_SENSORIAL sem violar LATENCIA_FEEDBACK (o retorno visual não pode sumir) |
+| Sem som = **volume 0**, a música continua tocando | Parar o mixer quebraria a sincronia chart × áudio e a prévia de 10 s |
+| Pacote **56 bytes** (≤ 64 do PACOTE_METRICAS), byte 54 reservado | Folga para o nível adaptativo/tempo por nível da S4 |
+
+Pendências que ficaram de fora: tempo por nível do metrônomo e modo adaptativo (S4), confirmação
+de pinos e síntese no Quartus, ensaio na placa (sensor a 5/15/25 cm, servo no tempo, falsos
+disparos do gesto de confirmação).
 
 ---
 
@@ -213,7 +277,12 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `unidade_controle.v` | FSM (idle→select→countdown→play→pause/win/lose; idle↔settings) |
 | `eq_config.v` | Níveis do atenuador de frequências (2 bits por faixa) |
 | `fluxo_dados.v` | Lógica do jogo: ROMs, frame counter, note tracks, score |
-| `packet_sender.v` | Serializa estado em pacote UART (49 bytes) |
+| `packet_sender.v` | Serializa estado em pacote UART (56 bytes) |
+| `hcsr04.v` | Medidor de distância (TRIG/ECHO → cm) |
+| `gesto_detector.v` | Mão na faixa, pulso de gesto e gesto de confirmação |
+| `cfg_jogo.v` | Página de configurações, modo do metrônomo, perfil sensorial, sem som |
+| `metronomo.v` / `servo_pwm.v` | Tempo da música e PWM do servo SG90 |
+| `bpm_params.vh` | Período/fase/troca de andamento por música (gerado) |
 | `note_track.v` | 1 trilha com 3 slots de nota; `hit_age` = idade da nota acertada |
 | `metricas.v` | Acumuladores da sessão: N, Σe, Σ\|e\|, Σe², notas/acertos por trilha, maior combo |
 | `taxa_acerto.v` | Divisor sequencial: taxa de acerto em % e dígitos para o HEX |
@@ -222,11 +291,12 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `contador_m.v` | Contador parametrizável |
 
 Testbenches (`tb/`): `tb_metricas.v` (cenários 2 e 3 do relatório, com 4 `note_track` reais),
-`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (49 bytes),
+`tb_taxa_acerto.v`, `tb_hex_taxa.v` (mux dos displays no top), `tb_packet_sender.v` (56 bytes),
 `tb_nome_perfil.v`, `tb_nome_top.v` (nome com os botões reais pelo debounce),
 `tb_baud_top.v` (top a 921600: pacote no pino TX, ACK no RX a 921600, 923077 e ±2%),
-`tb_note_track.v`, `tb_fd.v`, `tb_uc_*.v`, etc. `tb_countdown_transition.v` falha desde antes
-(segura o reset ativo e referencia um `u_game_timer` que não existe).
+`tb_note_track.v`, `tb_fd.v` (inclui gesto e páginas com modelo de eco), `tb_hcsr04.v`,
+`tb_gesto_detector.v`, `tb_cfg_jogo.v`, `tb_metronomo.v`, `tb_servo_pwm.v`, `tb_countdown_transition.v`
+(corrigido na S3), `tb_uc_*.v`, etc.
 
 Rodar sem o script `check`: `iverilog -g2012 -o .sim/X.out -s X rtl/*.v tb/X.v && vvp -n .sim/X.out`.
 O `make yosys` não funciona no macOS (o `sed` do BSD não aceita `\|`); rodar o yosys à mão
@@ -251,6 +321,9 @@ Tudo no **JP1 (GPIO_0)**; JP2 livre. Cabeçalho de 40 pinos: pinos 1-10 = GPIO[0
 | `botoes[3]` | 38 | T18 | idem |
 | `botoes[0]` | 39 | T17 | idem |
 | `botoes[2]` | 40 | T15 | idem |
+| `hcsr04_trig` | 4 | C16 | TRIG do HC-SR04 (sensor alimentado pelos 3,3 V do pino 29) |
+| `hcsr04_echo` | 6 | K20 | ECHO do HC-SR04 (≤ 3,3 V com o sensor a 3,3 V) |
+| `servo_pwm` | 8 | K22 | sinal do SG90 (servo na fonte de 5 V externa, GND comum) |
 | 3,3 V / GND | 29 / 30 | — | trilhos + / − dos pull-ups e botões |
 
 - Pull-ups dos botões são **externos**: solto = 1, apertado = 0. O `reset` usa o pull-up interno

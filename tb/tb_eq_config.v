@@ -9,6 +9,8 @@
  *   4. Pulsos simultaneos em faixas diferentes
  *   5. habilita=0 ignora os pulsos
  *   6. Reset no meio zera tudo
+ *   7. Paginas: o fluxo_dados liga `pulso` do eq_config a btn_pulse &
+ *      {4{~pagina}}; na pagina 1 o eq nao muda (tb_fd cobre no sistema)
  *-----------------------------------------------------------------------
  */
 `timescale 1ns/1ps
@@ -21,6 +23,8 @@ module tb_eq_config;
     reg        reset    = 1;
     reg        habilita = 0;
     reg  [3:0] pulso    = 4'b0000;
+    reg        pagina   = 1'b0;      // pagina de configuracao (cfg_jogo)
+    reg  [3:0] btn      = 4'b0000;   // botoes crus; o eq so ve os da pagina 0
     wire [7:0] eq;
 
     eq_config dut (
@@ -33,16 +37,20 @@ module tb_eq_config;
 
     always #(CLK_PERIOD/2) clock = ~clock;
 
+    // Mesma ligacao do fluxo_dados
+    always @* pulso = btn & {4{~pagina}};
+
     integer erros = 0;
+    reg [7:0] eq_ant;
 
     // Pulso de 1 ciclo nas faixas indicadas
     task press;
         input [3:0] mask;
         begin
             @(posedge clock); #1;
-            pulso = mask;
+            btn = mask;
             @(posedge clock); #1;
-            pulso = 4'b0000;
+            btn = 4'b0000;
         end
     endtask
 
@@ -93,6 +101,17 @@ module tb_eq_config;
         @(posedge clock); #1;
         reset = 0;
         expect_eq(8'h00, "6. reset zera");
+
+        // 7. Pagina 1: botoes nao chegam ao eq
+        habilita = 1;
+        press(4'b0001);
+        eq_ant = eq;
+        pagina = 1'b1;
+        press(4'b1111);
+        expect_eq(eq_ant[7:0], "7a. pagina 1: eq intocado");
+        pagina = 1'b0;
+        press(4'b0100);
+        expect_eq(eq_ant[7:0] + 8'b00_01_00_00, "7b. pagina 0: eq responde de novo");
 
         $display("---");
         if (erros == 0)

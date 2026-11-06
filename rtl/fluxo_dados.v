@@ -8,9 +8,10 @@
  * Logica implementada:
  *   - Gerador de frame_tick (~60fps com clock de 50MHz)
  *   - Timer de countdown (3 segundos = 180 frames)
- *   - 3 ROMs de chart (condado_curta/ocarina_curta/power_rangers)
+ *   - 4 ROMs de chart de 5 bits (4 trilhas + nota de gesto)
  *   - Contador de frames para indexar a ROM (depth dinamico por musica)
- *   - 4x note_track (um por trilha)
+ *   - 5x note_track (4 trilhas + nota de gesto do HC-SR04)
+ *   - hcsr04 + gesto_detector, cfg_jogo (pagina "Jogo") e metronomo (servo)
  *   - Contadores de score, misses e combo
  *   - Debounce + deteccao de borda para os botoes
  *   - Saida song_ok_pulso para selecao de musica na UC (btn0/1/2)
@@ -31,7 +32,20 @@
  *-----------------------------------------------------------------------
  */
 
-module fluxo_dados (
+// Caminho relativo ao diretorio de execucao (igual aos $readmemh abaixo): o
+// Quartus e o yosys rodam em quartus/de0_cv/ (macro QUARTUS), o Icarus na raiz.
+`ifdef QUARTUS
+`include "../../rtl/bpm_params.vh"
+`else
+`include "rtl/bpm_params.vh"
+`endif
+
+module fluxo_dados #(
+    // Sensor HC-SR04: defaults reais; os testbenches encurtam.
+    parameter integer HC_CLK_HZ     = 50_000_000,   // clock visto pelo hcsr04 (TB: 1 MHz = 1 ciclo/us)
+    parameter integer HC_CICLO_MS   = 60,
+    parameter integer HC_TIMEOUT_US = 25_000
+) (
     input  wire       clock,
     input  wire       reset,
 
@@ -45,6 +59,11 @@ module fluxo_dados (
 
     // Entradas fisicas
     input  wire [4:0] botoes_raw,      // [4]=Start/Pause, [3:0]=botoes do jogo
+
+    // HC-SR04 e servo do metronomo
+    input  wire       hcsr04_echo,
+    output wire       hcsr04_trig,
+    output wire       servo_pwm,
 
     // Saidas para UC
     output wire       jogada_feita,
@@ -92,7 +111,20 @@ module fluxo_dados (
 
     // Nome do perfil: 3 caracteres de 6 bits e cursor (ver nome_perfil.v)
     output wire [17:0] nome_out,
-    output wire [1:0]  nome_cursor
+    output wire [1:0]  nome_cursor,
+
+    // Gesto (sensor HC-SR04), contadores de gestos e configuracao "Jogo"
+    output wire [7:0]  dist_cm_out,
+    output wire [7:0]  gesto_age,        // age da nota de gesto (slot 0); 0xFF = nenhuma
+    output wire [7:0]  gestos_apres,     // gestos julgados (acerto + escape) na sessao
+    output wire [7:0]  gestos_acertos,   // gestos acertados na sessao
+    output wire [2:0]  progresso_out,    // progresso do gesto de confirmacao (0..7)
+    output wire        pagina_out,       // 0 = atenuador, 1 = jogo
+    output wire        sem_som_out,
+    output wire        sensorial_out,
+    output wire [1:0]  modo_met_out,
+    output wire        met_lado,
+    output wire [1:0]  met_nivel
 );
 
     // ----------------------------------------------------------------
@@ -142,13 +174,57 @@ module fluxo_dados (
     // Atenuador de frequencias: cada trilha avanca o nivel da sua faixa,
     // so no estado SETTINGS (db_estado == 7)
     // ----------------------------------------------------------------
+    wire em_settings = (db_estado == 4'b0111);
+    wire pagina;
+    wire [1:0] modo_met;
+    wire sensorial, sem_som;
+    wire confirma, gesto_pulso, na_faixa;
+    wire [2:0] progresso;
+    wire [7:0] dist_cm;
+    wire leitura_ok;
+
+    // O eq_config so recebe pulsos na pagina 0 (atenuador)
     eq_config u_eq (
         .clock   (clock),
         .reset   (reset),
-        .habilita(db_estado == 4'b0111),
-        .pulso   (btn_pulse),
+        .habilita(em_settings),
+        .pulso   (btn_pulse & {4{~pagina}}),
         .eq      (eq_out)
     );
+
+    // Pagina 1 ("Jogo"): metronomo, perfil sensorial, sem som; o gesto troca a pagina
+    cfg_jogo u_cfg (
+        .clock    (clock),
+        .reset    (reset),
+        .habilita (em_settings),
+        .confirma (confirma),
+        .pulso    (btn_pulse),
+        .pagina   (pagina),
+        .modo_met (modo_met),
+        .sensorial(sensorial),
+        .sem_som  (sem_som)
+    );
+
+    // HC-SR04 + detector de gesto (confirmacao so em SETTINGS; em PLAY vale
+    // gesto_pulso como "botao" da nota de gesto)
+    hcsr04 #(.CLK_HZ(HC_CLK_HZ), .CICLO_MS(HC_CICLO_MS), .TIMEOUT_US(HC_TIMEOUT_US)) u_hcsr04 (
+        .clock(clock), .reset(reset), .echo(hcsr04_echo),
+        .trig(hcsr04_trig), .dist_cm(dist_cm), .leitura_ok(leitura_ok)
+    );
+
+    gesto_detector u_gesto (
+        .clock(clock), .reset(reset), .habilita_confirma(em_settings),
+        .leitura_ok(leitura_ok), .dist_cm(dist_cm),
+        .na_faixa(na_faixa), .gesto_pulso(gesto_pulso),
+        .confirma(confirma), .progresso(progresso)
+    );
+
+    assign dist_cm_out   = dist_cm;
+    assign progresso_out = progresso;
+    assign pagina_out    = pagina;
+    assign sem_som_out   = sem_som;
+    assign sensorial_out = sensorial;
+    assign modo_met_out  = modo_met;
 
     // ----------------------------------------------------------------
     // Nome do perfil: D/F trocam o caractere, J/K movem o cursor, so no
@@ -213,7 +289,8 @@ module fluxo_dados (
 
     // ----------------------------------------------------------------
     // ROMs dos charts (uma por musica)
-    //   bit[i] = 1 → spawnar nota na trilha i neste frame
+    //   bit[i] = 1 → spawnar nota na trilha i neste frame (i = 0..3);
+    //   bit[4] = 1 → spawnar a nota de gesto (5a trilha)
     //   Profundidades declaradas como potencia de 2 para que o Quartus
     //   infira block RAM sem mismatch de tamanho no MIF.
     //   Os enderecos alem do chart real contem 0 (nenhum spawn).
@@ -223,10 +300,11 @@ module fluxo_dados (
     localparam integer ROM_DEPTH_2 = 4096;   // power_rangers:   3880 frames, padded to 2^12
     localparam integer ROM_DEPTH_3 = 4096;   // pokemon:         3718 frames, padded to 2^12
 
-    reg [3:0] chart_rom0 [0:ROM_DEPTH_0-1];
-    reg [3:0] chart_rom1 [0:ROM_DEPTH_1-1];
-    reg [3:0] chart_rom2 [0:ROM_DEPTH_2-1];
-    reg [3:0] chart_rom3 [0:ROM_DEPTH_3-1];
+    // [3:0] = trilhas, [4] = nota de gesto (HC-SR04)
+    reg [4:0] chart_rom0 [0:ROM_DEPTH_0-1];
+    reg [4:0] chart_rom1 [0:ROM_DEPTH_1-1];
+    reg [4:0] chart_rom2 [0:ROM_DEPTH_2-1];
+    reg [4:0] chart_rom3 [0:ROM_DEPTH_3-1];
 
     // Caminho relativo ao diretorio de execucao: o Quartus roda em
     // quartus/de0_cv/ (o .qsf define QUARTUS); Icarus e yosys, na raiz do repo.
@@ -315,6 +393,28 @@ module fluxo_dados (
         .hit_age(hit_age[3])
     );
 
+    // Nota de gesto: 5a instancia de note_track. O "botao" e o gesto_pulso
+    // (1 pulso por leitura do sensor com a mao entre 5 e 25 cm). O
+    // bad_press e ignorado (mao na faixa sem nota nao e erro, nao zera o
+    // combo nem entra em misses). Acerto: +100 e combo (como uma trilha);
+    // escape: conta como miss e zera o combo; nenhum dos dois entra nas
+    // metricas de assincronia/trilha (metricas.v so ve hit_pulse/escape_pulse
+    // das 4 trilhas).
+    wire       spawn_g, hit_g, escape_g, bad_g;
+    wire [7:0] hit_age_g, g0, g1, g2;
+
+    note_track u_track_g (
+        .clock(clock), .reset(reset | limpaR),
+        .frame_tick(frame_tick), .game_active(game_active),
+        .spawn_en(spawn_g), .btn_press(gesto_pulso),
+        .note0(g0), .note1(g1), .note2(g2),
+        .hit_pulse(hit_g), .escape_pulse(escape_g), .bad_press(bad_g),
+        .hit_age(hit_age_g)
+    );
+    assign gesto_age = g0;   // 1 gesto por vez (>= 10 s entre gestos)
+
+    wire gesto_has_slot = (g0 == 8'hFF) || (g1 == 8'hFF) || (g2 == 8'hFF);
+
     // Slot livre por trilha: spawn permitido se qualquer dos 3 slots estiver vazio
     wire [3:0] track_has_slot;
     assign track_has_slot[0] = (t0n0 == 8'hFF) || (t0n1 == 8'hFF) || (t0n2 == 8'hFF);
@@ -325,7 +425,7 @@ module fluxo_dados (
     // Mux de ROM: leitura sincrona para que o Quartus infira ROM (sem porta de escrita).
     // Como frame_tick ocorre apenas 1x a cada 833333 ciclos, o registrador
     // converge para ROM[frame_counter] muitos ciclos antes do proximo tick.
-    reg [3:0] chart_spawn_r;
+    reg [4:0] chart_spawn_r;
     always @(posedge clock) begin
         case (song_id_reg)
             2'd1:    chart_spawn_r <= chart_rom1[frame_counter];
@@ -336,12 +436,14 @@ module fluxo_dados (
     end
 
     // Spawn determinístico: lê a ROM no frame atual e filtra por slot disponível
-    wire [3:0] chart_spawn = (game_active && frame_tick) ? chart_spawn_r : 4'b0000;
-    assign spawn_en = chart_spawn & track_has_slot;
+    wire [4:0] chart_spawn = (game_active && frame_tick) ? chart_spawn_r : 5'b00000;
+    assign spawn_en = chart_spawn[3:0] & track_has_slot;
+    assign spawn_g  = chart_spawn[4] & gesto_has_slot;
 
-    wire any_hit    = |hit_pulse;
-    wire any_escape = |escape_pulse;
-    wire any_bad    = |bad_press;
+    // Acertos/escapes que valem para score, combo e misses: 4 trilhas + gesto
+    wire any_hit    = (|hit_pulse) | hit_g;
+    wire any_escape = (|escape_pulse) | escape_g;
+    wire any_bad    = |bad_press;   // so as 4 trilhas: bad_g e ignorado
 
     // ----------------------------------------------------------------
     // Score (16 bits): +100 por acerto + 1% do base por nivel de combo
@@ -412,6 +514,57 @@ module fluxo_dados (
         .notas       (met_notas),
         .acertos     (met_acertos),
         .max_combo   (met_max_combo)
+    );
+
+    // ----------------------------------------------------------------
+    // Contadores de gestos (8 bits). "Apresentados" = gestos julgados
+    // (acerto + escape): uma nota de gesto so conta ao sair (acertada ou
+    // escapada), entao ao fim do chart apresentados = total de gestos
+    // jogados. Zeram no COUNTDOWN e so contam em PLAY (congelam em
+    // PAUSE/END/IDLE), como metricas.v.
+    // ----------------------------------------------------------------
+    reg [7:0] gestos_apres_r, gestos_acertos_r;
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            gestos_apres_r   <= 8'd0;
+            gestos_acertos_r <= 8'd0;
+        end else if (db_estado == 4'b0001) begin
+            gestos_apres_r   <= 8'd0;
+            gestos_acertos_r <= 8'd0;
+        end else if (game_active) begin
+            if ((hit_g || escape_g) && gestos_apres_r != 8'hFF)
+                gestos_apres_r <= gestos_apres_r + 8'd1;
+            if (hit_g && gestos_acertos_r != 8'hFF)
+                gestos_acertos_r <= gestos_acertos_r + 8'd1;
+        end
+    end
+    assign gestos_apres   = gestos_apres_r;
+    assign gestos_acertos = gestos_acertos_r;
+
+    // ----------------------------------------------------------------
+    // Metronomo (servo): periodo/fase/troca de andamento por musica
+    // (bpm_params.vh, gerado por pc/gerar_hex.py). reinicia em nivel em
+    // IDLE, SELECT e COUNTDOWN; o tempo anda so em PLAY (game_active).
+    // ----------------------------------------------------------------
+    reg [31:0] met_periodo, met_fase, met_periodo2, met_ntroca;
+    always @* begin
+        case (song_id_reg)
+            2'd1:    begin met_periodo = `PERIODO_1; met_fase = `FASE_1; met_periodo2 = `PERIODO2_1; met_ntroca = `NTROCA_1; end
+            2'd2:    begin met_periodo = `PERIODO_2; met_fase = `FASE_2; met_periodo2 = `PERIODO2_2; met_ntroca = `NTROCA_2; end
+            2'd3:    begin met_periodo = `PERIODO_3; met_fase = `FASE_3; met_periodo2 = `PERIODO2_3; met_ntroca = `NTROCA_3; end
+            default: begin met_periodo = `PERIODO_0; met_fase = `FASE_0; met_periodo2 = `PERIODO2_0; met_ntroca = `NTROCA_0; end
+        endcase
+    end
+
+    wire met_reinicia = (db_estado == 4'b0000) || (db_estado == 4'b0110) || (db_estado == 4'b0001);
+
+    metronomo u_metronomo (
+        .clock(clock), .reset(reset),
+        .rodando(game_active), .reinicia(met_reinicia),
+        .modo(modo_met), .nivel_in(2'd0),
+        .periodo(met_periodo), .fase(met_fase),
+        .periodo2(met_periodo2), .ntroca(met_ntroca),
+        .tempo_pulso(), .lado(met_lado), .nivel(met_nivel), .servo(servo_pwm)
     );
 
     assign combo             = combo_reg;

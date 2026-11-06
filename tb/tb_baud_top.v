@@ -5,7 +5,7 @@
  * Usa o top com os parametros padrao (CLK_HZ=50MHz, BAUD=921600); so o
  * gerador de quadros e encurtado por defparam.
  *   1. CLKS_PER_BIT = 54 chega ao packet_sender e ao uart_link
- *   2. O pino TX manda 1 pacote de 49 bytes, 0x55 ... 0xAA, estado IDLE,
+ *   2. O pino TX manda 1 pacote de 56 bytes, 0x55 ... 0xAA, estado IDLE,
  *      lido por um receptor do TB amostrando a cada 54 ciclos
  *   3. Cada bit do TX dura exatamente 54 ciclos (1080 ns)
  *   4. O pino RX recebe bytes do PC a 921600, a 923077 (taxa real do
@@ -19,7 +19,7 @@ module tb_baud_top;
 
     localparam BIT   = 54;   // ciclos por bit esperados a 921600
     localparam real NS_PC = 1.0e9 / 921600.0;   // bit do PC (1085 ns)
-    localparam NPKT  = 49;
+    localparam NPKT  = 56;
 
     reg        clock  = 1'b0;
     reg        reset  = 1'b0;   // pino ativo em 0: 0 = em reset
@@ -39,10 +39,13 @@ module tb_baud_top;
         .leds_pulsos  (leds_pulsos),
         .db_botoes_raw(db_botoes_raw),
         .uart_tx_out  (tx_pin),
-        .uart_rx_in   (rx_pin)
+        .uart_rx_in   (rx_pin),
+        .hcsr04_trig  (),
+        .hcsr04_echo  (1'b0),    // sem eco: dist_cm = 0
+        .servo_pwm    ()
     );
 
-    // Quadro curto: o pacote (49 x 10 x 54 = 26460 ciclos) cabe folgado
+    // Quadro curto: o pacote (56 x 10 x 54 = 30240 ciclos) cabe folgado
     defparam dut.u_fd.u_frame_counter.M = 40_000;
 
     always #10 clock = ~clock;   // 50 MHz
@@ -130,8 +133,12 @@ module tb_baud_top;
             recebe_byte(byte_rx);
             pkt[k] = byte_rx;
         end
-        confere(pkt[NPKT-1] == 8'hAA, "2. footer 0xAA no byte 48");
+        confere(pkt[NPKT-1] == 8'hAA, "2. footer 0xAA no byte 55");
         confere((pkt[1] & 8'h0F) == 8'h00, "2. estado IDLE no byte 1");
+        confere(pkt[48] == 8'h00 && pkt[49] == 8'hFF && pkt[50] == 8'h00 && pkt[51] == 8'h00,
+                "2. sem eco, sem nota de gesto, contadores zerados (bytes 48-51)");
+        confere(pkt[52] == 8'h00 && pkt[53] == 8'h03 && pkt[54] == 8'h00,
+                "2. config zerada e metronomo desligado (nivel 3) nos bytes 52-54");
         confere(pkt[45] == 8'h00 && pkt[46] == 8'h00 && pkt[47] == 8'h00,
                 "2. nome '---' com cursor 0 nos bytes 45-47");
 

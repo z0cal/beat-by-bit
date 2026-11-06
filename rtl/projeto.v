@@ -21,7 +21,9 @@
 
 module beat_by_bit #(
     parameter CLK_HZ = 50_000_000,
-    parameter BAUD   = 921_600       // 50 MHz / 921600 = 54 ciclos/bit (925926 baud, +0,5%)
+    parameter BAUD   = 921_600,      // 50 MHz / 921600 = 54 ciclos/bit (925926 baud, +0,5%)
+    parameter HC_CICLO_MS   = 60,    // HC-SR04: periodo de medida (os TBs encurtam)
+    parameter HC_TIMEOUT_US = 25_000
 ) (
     input  wire        clock,
     input  wire        reset,
@@ -32,7 +34,10 @@ module beat_by_bit #(
     output wire [4:0]  leds_pulsos,  // LEDs de debug
     output wire [4:0]  db_botoes_raw,// Debug: botoes crus (LEDR 5-9)
     output wire        uart_tx_out,  // TX serial para o PC (BAUD)
-    input  wire        uart_rx_in    // RX serial: ACK do PC (TXD do CP2102)
+    input  wire        uart_rx_in,   // RX serial: ACK do PC (TXD do CP2102)
+    output wire        hcsr04_trig,  // GPIO_0_D3: TRIG do HC-SR04
+    input  wire        hcsr04_echo,  // GPIO_0_D5: ECHO do HC-SR04 (5 V -> divisor de tensao!)
+    output wire        servo_pwm     // GPIO_0_D7: sinal do servo do metronomo
 );
 
     // Reset invertido: o pino GPIO tem pull-up (1 quando solto),
@@ -74,6 +79,12 @@ module beat_by_bit #(
     wire [17:0] s_nome;
     wire [1:0]  s_nome_cursor;
 
+    // Gesto, configuracao "Jogo" e metronomo (FD -> packet_sender)
+    wire [7:0]  s_dist_cm, s_gesto_age, s_gestos_apres, s_gestos_acertos;
+    wire [2:0]  s_progresso;
+    wire        s_pagina, s_sem_som, s_sensorial, s_met_lado;
+    wire [1:0]  s_modo_met, s_met_nivel;
+
     // LEDR3 = link serial ok (PC recebendo pacotes); perdeu e fixo em 0
     assign leds_pulsos = {s_start_pulso, s_fim_contagem, s_fim_tempo, s_link_ok, s_jogada_feita};
 
@@ -103,7 +114,7 @@ module beat_by_bit #(
     // ----------------------------------------------------------------
     // Fluxo de Dados (toda logica do jogo)
     // ----------------------------------------------------------------
-    fluxo_dados u_fd (
+    fluxo_dados #(.HC_CICLO_MS(HC_CICLO_MS), .HC_TIMEOUT_US(HC_TIMEOUT_US)) u_fd (
         .clock        (clock),
         .reset        (reset_i),
         .limpaR       (s_limpaR),
@@ -140,7 +151,21 @@ module beat_by_bit #(
         .met_acertos       (s_met_acertos),
         .met_max_combo     (s_met_max_combo),
         .nome_out          (s_nome),
-        .nome_cursor       (s_nome_cursor)
+        .nome_cursor       (s_nome_cursor),
+        .hcsr04_echo       (hcsr04_echo),
+        .hcsr04_trig       (hcsr04_trig),
+        .servo_pwm         (servo_pwm),
+        .dist_cm_out       (s_dist_cm),
+        .gesto_age         (s_gesto_age),
+        .gestos_apres      (s_gestos_apres),
+        .gestos_acertos    (s_gestos_acertos),
+        .progresso_out     (s_progresso),
+        .pagina_out        (s_pagina),
+        .sem_som_out       (s_sem_som),
+        .sensorial_out     (s_sensorial),
+        .modo_met_out      (s_modo_met),
+        .met_lado          (s_met_lado),
+        .met_nivel         (s_met_nivel)
     );
 
     // ----------------------------------------------------------------
@@ -171,6 +196,17 @@ module beat_by_bit #(
         .met_acertos   (s_met_acertos),
         .nome          (s_nome),
         .nome_cursor   (s_nome_cursor),
+        .dist_cm       (s_dist_cm),
+        .gesto_age     (s_gesto_age),
+        .gestos_apres  (s_gestos_apres),
+        .gestos_acertos(s_gestos_acertos),
+        .progresso     (s_progresso),
+        .pagina        (s_pagina),
+        .sem_som       (s_sem_som),
+        .sensorial     (s_sensorial),
+        .modo_met      (s_modo_met),
+        .met_lado      (s_met_lado),
+        .met_nivel     (s_met_nivel),
         .uart_tx_out   (uart_tx_out)
     );
 

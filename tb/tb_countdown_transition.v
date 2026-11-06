@@ -3,7 +3,7 @@
 module tb_countdown_transition;
 
     reg        clock  = 1'b0;
-    reg        reset  = 1'b1;
+    reg        reset  = 1'b0;   // pino ativo em 0: 0 = em reset
     reg [4:0]  botoes = 5'b0;
 
     wire [6:0] db_estado;
@@ -18,23 +18,31 @@ module tb_countdown_transition;
         .db_estado  (db_estado),
         .db_jogada  (db_jogada),
         .leds_pulsos(leds_pulsos),
-        .uart_tx_out(uart_tx_out)
+        .uart_tx_out(uart_tx_out),
+        .uart_rx_in (1'b1),
+        .hcsr04_trig(),
+        .hcsr04_echo(1'b0),
+        .servo_pwm  ()
     );
 
     // Encurta a simulacao sem alterar a logica do hardware real.
     defparam dut.u_fd.u_frame_counter.M = 4;
     defparam dut.u_fd.u_countdown.M     = 6;
-    defparam dut.u_fd.u_game_timer.M    = 20;
+    defparam dut.u_fd.u_db_btn0.DEBOUNCE_CYCLES  = 8;
+    defparam dut.u_fd.u_db_start.DEBOUNCE_CYCLES = 8;
     defparam dut.u_pkt.u_tx.CLKS_PER_BIT = 4;
 
     always #5 clock = ~clock;
 
-    task press_start;
+    // Aperta e solta o botao i (o debounce exige borda e bloqueia 8 ciclos)
+    task aperta;
+        input integer i;
         begin
             @(posedge clock);
-            botoes[4] <= 1'b1;
-            repeat (4) @(posedge clock);
-            botoes[4] <= 1'b0;
+            botoes[i] <= 1'b1;
+            repeat (6) @(posedge clock);
+            botoes[i] <= 1'b0;
+            repeat (12) @(posedge clock);
         end
     endtask
 
@@ -42,12 +50,13 @@ module tb_countdown_transition;
         $display("=== TB countdown transition ===");
 
         repeat (3) @(posedge clock);
-        reset <= 1'b0;
+        reset <= 1'b1;   // solta o reset (o top inverte o pino)
 
         repeat (2) @(posedge clock);
-        press_start();
+        aperta(4);       // START: IDLE -> SELECT
+        aperta(0);       // trilha 0 escolhe a musica: SELECT -> COUNTDOWN
 
-        repeat (20) begin
+        repeat (40) begin
             @(posedge clock);
             $display("t=%0t state=%0d frame_q=%0d cd_q=%0d fim_contagem=%0b countdown=%0d",
                      $time,

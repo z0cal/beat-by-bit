@@ -41,6 +41,7 @@ def testa(port, baud, segundos):
     total, pacotes = 0, 0
     primeiros = bytearray()
     estados = []
+    ultimo = None
     fim = time.monotonic() + segundos
     while time.monotonic() < fim:
         data = ser.read(max(1, ser.in_waiting))
@@ -56,6 +57,7 @@ def testa(port, baud, segundos):
             if pkt is None:
                 break
             pacotes += 1
+            ultimo = pkt
             ser.write(bytes([ACK_BYTE]))
             if not estados or estados[-1] != pkt["state"]:
                 estados.append(pkt["state"])
@@ -67,6 +69,13 @@ def testa(port, baud, segundos):
     print(f"  primeiros bytes : {primeiros[:32].hex(' ')}")
     if estados:
         print("  estados vistos  : " + " -> ".join(STATE_NAMES.get(s, str(s)) for s in estados))
+    if ultimo:
+        u = ultimo
+        print(f"  ultimo pacote   : dist {u['dist_cm']} cm, gesto_age {u['gesto_age']:#04x}, "
+              f"gestos {u['gestos_acert']}/{u['gestos_apres']}, modo_met {u['modo_met']}, "
+              f"sensorial {int(u['sensorial'])}, sem_som {int(u['sem_som'])}, "
+              f"pagina {u['pagina']}, progresso {u['progresso']}, "
+              f"met nivel {u['met_nivel']} lado {u['met_lado']}")
     if total == 0:
         print("  >> nada chegou: confira GND comum, TX da FPGA (PIN_N16) no RXD do conversor,")
         print("     reset solto (HEX0 aceso) e se a porta e a certa")

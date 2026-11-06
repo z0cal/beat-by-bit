@@ -4,7 +4,7 @@ Renderer puro: recebe pacotes da FPGA via UART e renderiza o jogo.
 Nenhuma logica de jogo aqui — tudo roda na FPGA (Verilog).
 
 Protocolo UART (921600 baud, 8N1; --baud muda):
-  Pacote de 49 bytes a ~60fps (multibyte em big-endian):
+  Pacote de 56 bytes a ~60fps (multibyte em big-endian):
     [0]  0x55              marcador de inicio
     [1]  {eq_lo, state}    state (bits 3:0): 0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE
                            4=WIN 5=LOSE 6=SELECT 7=SETTINGS
@@ -33,7 +33,17 @@ Protocolo UART (921600 baud, 8N1; --baud muda):
     [45]    {cursor[1:0], c0}  c0 = caractere da esquerda
     [46]    c1
     [47]    c2                 caractere: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
-    [48] 0xAA              marcador de fim
+    --- sensor HC-SR04, nota de gesto, configuracao e metronomo ---
+    [48]    distancia em cm (saturada em 255; 0 = sem eco)
+    [49]    idade da nota de gesto (0xFF = nenhuma)
+    [50]    gestos apresentados
+    [51]    gestos acertados
+    [52]    config: [1:0] modo do metronomo (0 desl., 1 fixo, 2 adaptativo=fixo),
+            [2] perfil sensorial, [3] sem som, [4] pagina das configuracoes
+            (0 = atenuador, 1 = jogo), [7:5] progresso do gesto de confirmacao (0-7)
+    [53]    metronomo: [1:0] nivel (0=60, 1=30, 2=15 graus, 3=parado), [2] lado do braco
+    [54]    reservado (0)
+    [55] 0xAA              marcador de fim
 
   Retorno (PC -> FPGA): 1 byte ACK (0xA5) a cada ACK_INTERVAL s enquanto
   chegam pacotes validos. A FPGA acende LEDR3 enquanto recebe ACKs.
@@ -218,12 +228,19 @@ SONGS = [
     },
 ]
 
-PACKET_SIZE = 49
+PACKET_SIZE = 56
 PKT_HEADER = 0x55
 PKT_FOOTER = 0xAA
 ACK_BYTE = 0xA5
 ACK_INTERVAL = 0.25  # s; a FPGA apaga o LED apos 1 s sem ACK
 EMPTY_SLOT = 0xFF
+GESTO_COR = (230, 70, 255)  # magenta: nao pertence a nenhuma trilha
+FAIXA_MIN_CM, FAIXA_MAX_CM = 5, 25  # faixa do gesto (gesto_detector.v)
+GESTO_CONFIRMA_LEITURAS = 16  # leituras seguidas na faixa que trocam a pagina
+GESTO_REARMA_LEITURAS = 4  # leituras seguidas fora da faixa que rearmam
+LEITURA_FRAMES = 3.6  # ~60 ms entre leituras do HC-SR04, em quadros de 1/60 s
+MUSIC_VOLUME = 0.70
+MET_ANGULOS = (60, 30, 15, 0)  # graus por nivel do metronomo (3 = parado)
 
 # ─── Atenuador de frequencias (tela de configuracoes) ────────────────────────
 # Uma faixa por botao de trilha. Na tela de configuracoes, cada aperto avanca o
@@ -400,7 +417,22 @@ def parse_packet(data, offset):
     frame_counter = ((data[offset + 19] & 0x3F) << 8) | data[offset + 20]
     song_id = (data[offset + 19] >> 6) & 0x03
 
+    gesto_age = data[offset + 49]
+    cfg = data[offset + 52]
+    met = data[offset + 53]
     return {
+        "dist_cm": data[offset + 48],
+        "gesto_age": gesto_age,
+        "gesto_y": None if gesto_age == EMPTY_SLOT else round(gesto_age * NOTE_SPEED),
+        "gestos_apres": data[offset + 50],
+        "gestos_acert": data[offset + 51],
+        "modo_met": cfg & 0x03,
+        "sensorial": bool(cfg & 0x04),
+        "sem_som": bool(cfg & 0x08),
+        "pagina": (cfg >> 4) & 1,
+        "progresso": (cfg >> 5) & 0x07,
+        "met_nivel": met & 0x03,
+        "met_lado": (met >> 2) & 1,
         "state": state,
         "countdown": countdown,
         "notes": notes,
@@ -452,6 +484,8 @@ def _parse_metrics(data, o):
         "soma_e2": u24(30),
         "notas": notas,
         "acertos": acertos,
+        "gestos_apres": data[o + 50],
+        "gestos_acert": data[o + 51],
     }
 
 
@@ -464,6 +498,8 @@ def empty_metrics():
         "soma_e2": 0,
         "notas": [0] * 4,
         "acertos": [0] * 4,
+        "gestos_apres": 0,
+        "gestos_acert": 0,
     }
 
 
@@ -528,10 +564,13 @@ SESSION_FIELDS = (
     + [f"notas_{k}" for k in TRACK_LABELS]
     + [f"acertos_{k}" for k in TRACK_LABELS]
     + ["soma_e", "soma_abs", "soma_e2"]
+    + ["gestos_apresentados", "gestos_acertados", "modo_metronomo", "perfil_sensorial"]
 )
+MET_MODOS = ("desligado", "fixo", "adaptativo")
 
 
-def session_row(m, pseudonym, song_id, won, score, misses, when=None):
+def session_row(m, pseudonym, song_id, won, score, misses, when=None,
+                modo_met=0, sensorial=False):
     """Linha do CSV de historico (e, na Semana 4, o JSON do MQTT)."""
     summ = session_summary(m)
 
@@ -556,6 +595,10 @@ def session_row(m, pseudonym, song_id, won, score, misses, when=None):
         "soma_e": m["soma_e"],
         "soma_abs": m["soma_abs"],
         "soma_e2": m["soma_e2"],
+        "gestos_apresentados": m.get("gestos_apres", 0),
+        "gestos_acertados": m.get("gestos_acert", 0),
+        "modo_metronomo": MET_MODOS[min(modo_met, 2)],
+        "perfil_sensorial": int(bool(sensorial)),
     }
     for t, k in enumerate(TRACK_LABELS):
         row[f"notas_{k}"] = m["notas"][t]
@@ -588,11 +631,16 @@ class SessionLog:
             return None
         return last
 
+    def _migrate(self):
+        _migrate_csv(self.path)
+
     def append(self, row):
         """Grava a linha. Retorna (ok, mensagem)."""
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+            if not new:
+                self._migrate()
             with open(self.path, "a", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=SESSION_FIELDS)
                 if new:
@@ -605,6 +653,19 @@ class SessionLog:
         except OSError as e:
             print(f"[historico] falha ao gravar {self.path}: {e}")
             return False, "Falha ao salvar a sessao (veja o terminal)"
+
+
+def _migrate_csv(path):
+    """CSV antigo (sem as colunas de gesto/config): reescreve com o cabecalho novo."""
+    with open(path, newline="", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        if rd.fieldnames is None or list(rd.fieldnames) == SESSION_FIELDS:
+            return
+        rows = list(rd)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SESSION_FIELDS, restval="", extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
 
 def _num(v):
@@ -660,6 +721,21 @@ _DIFF_PRESETS = {
 }
 _MIN_NOTE_SPACING, _GLOBAL_SPACING, _MAX_SIMULTANEOUS = _DIFF_PRESETS[DIFFICULTY]
 
+# ─── Chart: notas de gesto (bit 4 da ROM) ─────────────────────────────────────
+# ESPACAMENTO_GESTO: no maximo 1 gesto a cada GESTO_MIN_GAP_FRAMES e GESTO_CLEAR_FRAMES
+# sem nota de botao antes e depois de cada gesto. O gesto e uma entrada sozinha.
+GESTO_BIT = 4
+GESTO_MIN_GAP_FRAMES = 600  # 10 s entre gestos
+GESTO_CLEAR_FRAMES = 60  # 1 s livre de notas de botao antes e depois
+GESTO_FIRST_FRAME = 600  # primeiro gesto so depois de ~10 s
+GESTO_COUNT = 4  # gestos por musica (alvo; menos se nao houver posicao valida)
+GESTO_SEARCH_FRAMES = 200  # busca a posicao ideal de cada gesto em +-esta janela
+
+# ─── Metronomo: andamento do MIDI (rtl/bpm_params.vh) ─────────────────────────
+CLOCK_HZ = 50_000_000
+FRAME_CYCLES = 833_333  # ciclos por quadro: M do contador frame_tick em fluxo_dados.v
+BPM_VH = os.path.join(_RTL_DIR, "bpm_params.vh")
+
 
 # ─── Chart: melodia ───────────────────────────────────────────────────────────
 # O chart segue a melodia (canais "melody" de cada musica), nao a harmonia.
@@ -671,6 +747,132 @@ _FILL_MARGIN_S = 0.5  # distancia minima entre preenchimento e nota da melodia
 _CHORD_S = 0.04  # onsets mais proximos que isso contam como um acorde
 _DRUM_CHANNEL = 9
 _LANE_SLOT_SPAN = 152  # 4 notas seguidas na trilha precisam caber em 3 slots (MISS_AGE + 1)
+
+
+def _midi_tempo_info(midi_path):
+    """
+    Andamento do MIDI: (tempo_us, n_tempos) com o primeiro set_tempo (500000 = 120 BPM
+    se nao houver). n_tempos > 1 significa mudanca de andamento (so o primeiro vale).
+    O primeiro tempo e sempre o tick 0 (inicio do MIDI = inicio do audio).
+    """
+    import mido
+
+    tempos = [
+        (tk, m.tempo)
+        for tk, m in _abs_events(mido.MidiFile(midi_path))
+        if m.type == "set_tempo"
+    ]
+    if not tempos:
+        return 500_000, 0
+    return tempos[0][1], len(tempos)
+
+
+def _midi_tempo_list(midi_path):
+    """([(tick, tempo_us)], ticks_per_beat); lista vazia se o MIDI nao tem set_tempo."""
+    import mido
+
+    mid = mido.MidiFile(midi_path)
+    return [(tk, m.tempo) for tk, m in _abs_events(mid) if m.type == "set_tempo"], mid.ticks_per_beat
+
+
+def _abs_events(mid):
+    """Eventos (tick absoluto, msg) de todas as trilhas, em ordem de tick."""
+    ev = []
+    for tr in mid.tracks:
+        tk = 0
+        for m in tr:
+            tk += m.time
+            ev.append((tk, m))
+    return sorted(ev, key=lambda e: e[0])
+
+
+def bpm_params(song_config):
+    """
+    Parametros do metronomo de uma musica, em ciclos de 50 MHz:
+      periodo: duracao de um tempo = tempo_us * 50 (inteiro exato).
+      fase: ciclos desde frame_counter = 0 (inicio do PLAY) ate o primeiro tempo
+            CHEGAR a hit zone: tempo em t = 0 s do audio, que a nota correspondente
+            atinge o alvo em t*60 + AUDIO_LATENCY_FRAMES quadros (a nota e criada
+            HIT_AGE quadros antes: ver _midi_to_chart). Quadro = FRAME_CYCLES ciclos.
+    Retorna dict(periodo, fase, bpm, n_tempos, tempo_us).
+    """
+    tempos, tpb = _midi_tempo_list(song_config["midi"])
+    tempo_us, n = _midi_tempo_info(song_config["midi"])
+    periodo = tempo_us * (CLOCK_HZ // 1_000_000)
+    # Segundo andamento: so o primeiro tempo que ja o usa (arredondado para o tempo mais
+    # proximo; nao_alinhado avisa se o set_tempo nao cai exatamente num tempo).
+    periodo2, ntroca, nao_alinhado = periodo, 0xFFFFFFFF, False
+    if len(tempos) > 1:
+        tk, t2 = tempos[1]
+        periodo2 = t2 * (CLOCK_HZ // 1_000_000)
+        ntroca = round(tk / tpb)
+        nao_alinhado = tk % tpb != 0
+    fase = AUDIO_LATENCY_FRAMES * FRAME_CYCLES  # primeiro tempo em t = 0 s
+    fase %= periodo
+    return {
+        "periodo": periodo,
+        "fase": fase,
+        "bpm": 60e6 / tempo_us,
+        "n_tempos": n,
+        "tempo_us": tempo_us,
+        "periodo2": periodo2,
+        "ntroca": ntroca,
+        "nao_alinhado": nao_alinhado,
+        "bpm2": 60e6 / (periodo2 / 50) if n > 1 else None,
+    }
+
+
+def write_bpm_params(songs=None, path=None):
+    """Gera rtl/bpm_params.vh (PERIODO_n/FASE_n por slot de musica)."""
+    songs = songs or SONGS
+    lines = [
+        "// Gerado por pc/gerar_hex.py (pc/interface.py: bpm_params). NAO EDITAR A MAO.",
+        "//",
+        "// Parametros do metronomo por musica (slot = indice em SONGS / song_id_reg:",
+        "// 0 condado, 1 ocarina, 2 power_rangers, 3 pokemon). Tudo em ciclos de 50 MHz.",
+        "//",
+        "// PERIODO_n = duracao de um tempo = (microssegundos por tempo do primeiro",
+        "//             set_tempo do MIDI) * 50, inteiro exato. Sem set_tempo: 120 BPM.",
+        "//             Os tempos 0..NTROCA_n-1 usam PERIODO_n.",
+        "// PERIODO2_n / NTROCA_n = segundo andamento do MIDI (2o set_tempo): PERIODO2_n e o",
+        "//             tempo depois da troca e NTROCA_n o indice k do primeiro tempo que ja usa",
+        "//             PERIODO2_n (round(tick_da_troca / ticks_por_tempo); AVISO se a troca nao",
+        "//             cai exatamente num tempo). Um so andamento: PERIODO2_n = PERIODO_n e",
+        "//             NTROCA_n = 32'hFFFFFFFF. Mais de 2 andamentos: so os 2 primeiros (AVISO).",
+        "//             Tempo k chega em FASE + k*PERIODO (k < NTROCA) ou",
+        "//             FASE + NTROCA*PERIODO + (k-NTROCA)*PERIODO2 (k >= NTROCA).",
+        "// FASE_n    = ciclos desde frame_counter = 0 (inicio do PLAY) ate o primeiro",
+        "//             tempo CHEGAR a hit zone. O primeiro tempo e o tick 0 do MIDI (t = 0",
+        "//             s do audio); a nota correspondente seria criada HIT_AGE (130)",
+        "//             quadros antes e atinge o alvo em t*60 + AUDIO_LATENCY_FRAMES",
+        f"//             quadros (= {AUDIO_LATENCY_FRAMES} quadros aqui), igual ao deslocamento de",
+        f"//             _midi_to_chart. Quadro = {FRAME_CYCLES} ciclos (M do frame_tick em",
+        "//             fluxo_dados.v). FASE_n = AUDIO_LATENCY_FRAMES * 833333, mod PERIODO_n.",
+        "// O tempo k chega ao alvo em FASE_n + k * PERIODO_n ciclos apos o inicio do PLAY.",
+        "//",
+    ]
+    for i, song in enumerate(songs):
+        p = bpm_params(song)
+        aviso = (
+            (f"  troca para {p['bpm2']:.3f} BPM no tempo {p['ntroca']}"
+             + ("  AVISO: troca fora do tempo, arredondada" if p["nao_alinhado"] else "")
+             + (f"  AVISO: {p['n_tempos']} andamentos, usados so os 2 primeiros" if p["n_tempos"] > 2 else ""))
+            if p["n_tempos"] > 1
+            else ""
+        )
+        lines.append(f"// slot {i}: {song['title']}, {p['bpm']:.3f} BPM{aviso}")
+    lines.append("")
+    for i, song in enumerate(songs):
+        p = bpm_params(song)
+        lines.append(f"`define PERIODO_{i} 32'd{p['periodo']}")
+        lines.append(f"`define FASE_{i}    32'd{p['fase']}")
+        lines.append(f"`define PERIODO2_{i} 32'd{p['periodo2']}")
+        lines.append(f"`define NTROCA_{i}  32'd{p['ntroca']}" if p["ntroca"] != 0xFFFFFFFF
+                     else f"`define NTROCA_{i}  32'hFFFFFFFF")
+    text = "\n".join(lines) + "\n"
+    with open(path or BPM_VH, "w") as fh:
+        fh.write(text)
+    return text
 
 
 def _midi_notes(midi_path):
@@ -827,25 +1029,63 @@ def _midi_to_chart(song_config=None, save_hex=False):
             for j in range(max(0, i - 3), min(i, len(seq) - 4) + 1)
         )
 
-    # Notas monofonicas: _MAX_SIMULTANEOUS nao se aplica (o skyline ja tirou acordes)
-    chosen, by_lane = [], [[] for _ in range(4)]
-    for n in sorted(cands, key=lambda n: (n["metric"], not n["fill"], n["dur"]), reverse=True):
-        if len(chosen) >= target:
-            break
-        f = n["frame"]
-        if not fits(chosen, f, _GLOBAL_SPACING):
-            continue
-        # Trilha preferida primeiro, depois as vizinhas por distancia
-        for lane in sorted(range(4), key=lambda l: (abs(l - n["lane"]), l)):
-            if fits(by_lane[lane], f, _MIN_NOTE_SPACING) and slots_ok(by_lane[lane], f):
-                chosen.append(f)
-                by_lane[lane].append(f)
+    def select(forbidden):
+        """Notas de botao por prioridade; `forbidden` = quadros que nao podem receber nota."""
+        chosen, by_lane = [], [[] for _ in range(4)]
+        # Notas monofonicas: _MAX_SIMULTANEOUS nao se aplica (o skyline ja tirou acordes)
+        for n in sorted(cands, key=lambda n: (n["metric"], not n["fill"], n["dur"]), reverse=True):
+            if len(chosen) >= target:
                 break
+            f = n["frame"]
+            if f in forbidden or not fits(chosen, f, _GLOBAL_SPACING):
+                continue
+            # Trilha preferida primeiro, depois as vizinhas por distancia
+            for lane in sorted(range(4), key=lambda l: (abs(l - n["lane"]), l)):
+                if fits(by_lane[lane], f, _MIN_NOTE_SPACING) and slots_ok(by_lane[lane], f):
+                    chosen.append(f)
+                    by_lane[lane].append(f)
+                    break
+        return chosen, by_lane
+
+    chosen, by_lane = select(set())
+
+    # Notas de gesto: GESTO_COUNT posicoes espalhadas, nas cabecas de compasso/tempos
+    # que atrapalham menos notas de botao. Depois, o chart de botoes e refeito sem
+    # nada a +-GESTO_CLEAR_FRAMES de cada gesto (preenche com outras candidatas).
+    gestos = []
+    lo, hi = GESTO_FIRST_FRAME, total_frames - _LANE_SLOT_SPAN - 2
+    if GESTO_COUNT > 0 and hi > lo:
+        seg = (hi - lo) / GESTO_COUNT
+        for k in range(GESTO_COUNT):
+            alvo = lo + (k + 0.5) * seg
+            lo_k = max(lo, gestos[-1] + GESTO_MIN_GAP_FRAMES) if gestos else lo
+            pos = [
+                n for n in cands
+                if lo_k <= n["frame"] <= hi
+                and abs(n["frame"] - alvo) <= GESTO_SEARCH_FRAMES
+            ]
+            if not pos:
+                continue
+
+            def custo(n):
+                f = n["frame"]
+                removidas = sum(abs(f - g) < GESTO_CLEAR_FRAMES for g in chosen)
+                return (removidas, -n["metric"], abs(f - alvo))
+
+            gestos.append(min(pos, key=custo)["frame"])
+    if gestos:
+        proibido = {
+            f for g in gestos
+            for f in range(g - GESTO_CLEAR_FRAMES + 1, g + GESTO_CLEAR_FRAMES)
+        }
+        chosen, by_lane = select(proibido)
 
     rom = [0] * total_frames
     for lane, frames in enumerate(by_lane):
         for f in frames:
             rom[f] |= 1 << lane
+    for g in gestos:
+        rom[g] = 1 << GESTO_BIT
 
     if save_hex:
         with open(song_config["hex"], "w") as fh:
@@ -853,6 +1093,7 @@ def _midi_to_chart(song_config=None, save_hex=False):
                 fh.write(f"{v:02X}\n")
         print(
             f"[chart] {song_config['hex']} gerado: {len(rom)} frames, {len(chosen)} notas "
+            f"+ {len(gestos)} gestos {gestos} "
             f"(alvo {target}, {sum(not n['fill'] for n in cands)} da melodia + "
             f"{sum(n['fill'] for n in cands)} de preenchimento candidatas)"
         )
@@ -895,21 +1136,66 @@ class SimulationEngine:
         ]
         self._chart = self._charts[self._selected_song]
         self._rom_depth = len(self._chart)
+        # Nota de gesto: 5a "trilha" com 1 slot (bit 4 do chart)
+        self._gage = self.EMPTY
+        # Sensor HC-SR04 / gesto_detector: leitura a cada ~60 ms
+        self._dist = 0
+        self._ler_acc = 0.0
+        self._leitura_ok = False  # houve leitura neste quadro
+        self._cnt = 0  # leituras seguidas na faixa (SETTINGS)
+        self._fora = 0  # leituras seguidas fora da faixa
+        self._armado = True
+        # cfg_jogo: so zeram no reset, como eq_config
+        self._pagina = 0
+        self._modo_met = 0
+        self._sensorial = False
+        self._sem_som = False
+        # Metronomo: ciclos de PLAY acumulados (congela fora de PLAY)
+        self._met_cycles = 0
+        self._met_params = [self._met_slot(s) for s in SONGS if s["available"]]
+
+    @staticmethod
+    def _met_slot(song):
+        """(periodo, fase, periodo2, ntroca) em ciclos de 50 MHz (como bpm_params.vh)."""
+        try:
+            p = bpm_params(song)
+            return p["periodo"], p["fase"], p["periodo2"], p["ntroca"]
+        except Exception as e:  # mido ausente ou MIDI sem tempo: 120 BPM
+            print(f"[sim] metronomo: andamento padrao 120 BPM ({e})")
+            per = 500_000 * (CLOCK_HZ // 1_000_000)
+            return per, AUDIO_LATENCY_FRAMES * FRAME_CYCLES % per, per, 0xFFFFFFFF
+
+    def _met_beats(self):
+        """Tempos que ja chegaram ao alvo: tempo k chega em FASE + k*PERIODO (...PERIODO2)."""
+        per, fase, per2, ntroca = self._met_params[self._selected_song]
+        c = self._met_cycles
+        if c < fase:
+            return 0
+        if ntroca == 0xFFFFFFFF or c < fase + ntroca * per:
+            return (c - fase) // per + 1
+        return ntroca + (c - fase - ntroca * per) // per2 + 1
 
     # ── API publica ──────────────────────────────────────────────────────────
 
-    def step(self, btn):
+    def step(self, btn, mao=False):
         """
-        Avanca um frame. btn = [track0, track1, track2, track3, start] (bool).
-        Retorna dict compativel com parse_packet().
+        Avanca um frame. btn = [track0, track1, track2, track3, start] (bool);
+        mao = mao na faixa do sensor (tecla G). Retorna dict compativel com parse_packet().
         """
+        self._sensor(mao)
         self._fsm(btn)
+        if self.state == STATE_SETTINGS:
+            self._gesto_confirma()
+        else:
+            self._cnt = 0
 
         if self.state == STATE_PLAY:
             self._advance_ages()
             self._check_escapes()
             self._spawn_notes()
             self._process_buttons(btn)
+            self._process_gesto()
+            self._met_cycles += FRAME_CYCLES
             if self.misses >= MAX_MISSES:
                 self.state = STATE_LOSE
             elif self._chart_frame >= self._rom_depth:
@@ -922,7 +1208,21 @@ class SimulationEngine:
         for track in self._ages:
             notes.append([round(age * NOTE_SPEED) for age in track if age != self.EMPTY])
 
+        met_on = self.state == STATE_PLAY and self._modo_met != 0
+        m = self._met
         return {
+            "dist_cm": self._dist,
+            "gesto_age": self._gage,
+            "gesto_y": None if self._gage == self.EMPTY else round(self._gage * NOTE_SPEED),
+            "gestos_apres": m["gestos_apres"],
+            "gestos_acert": m["gestos_acert"],
+            "modo_met": self._modo_met,
+            "sensorial": self._sensorial,
+            "sem_som": self._sem_som,
+            "pagina": self._pagina,
+            "progresso": min(7, self._cnt // 2) if self.state == STATE_SETTINGS else 0,
+            "met_nivel": 0 if met_on else 3,
+            "met_lado": self._met_beats() & 1 if self._modo_met != 0 else 0,
             "state": self.state,
             "countdown": countdown_sec,
             "notes": notes,
@@ -951,10 +1251,17 @@ class SimulationEngine:
         elif self.state == STATE_SETTINGS:
             if start:
                 self.state = STATE_IDLE
-            else:
+            elif self._pagina == 0:
                 for i in range(4):
                     if btn[i]:
                         self._eq[i] = (self._eq[i] + 1) % EQ_LEVELS
+            else:  # pagina "Jogo": D metronomo, F sensorial, J sem som
+                if btn[0]:
+                    self._modo_met = 0 if self._modo_met else 1
+                if btn[1]:
+                    self._sensorial = not self._sensorial
+                if btn[2]:
+                    self._sem_som = not self._sem_som
         elif self.state == STATE_SONG_SELECT:
             if start:
                 self.state = STATE_IDLE
@@ -992,6 +1299,48 @@ class SimulationEngine:
         if self.state not in (STATE_WIN, STATE_LOSE):
             self._cursor = 0
 
+    def _sensor(self, mao):
+        """HC-SR04: uma leitura a cada ~60 ms; mao na faixa = ~15 cm, fora = ~60 cm."""
+        self._leitura_ok = False
+        self._ler_acc += 1
+        if self._ler_acc >= LEITURA_FRAMES:
+            self._ler_acc -= LEITURA_FRAMES
+            self._dist = 15 if mao else 60
+            self._leitura_ok = True
+
+    def _na_faixa(self):
+        return FAIXA_MIN_CM <= self._dist <= FAIXA_MAX_CM
+
+    def _gesto_confirma(self):
+        """gesto_detector.v: 16 leituras na faixa trocam a pagina; rearma apos 4 fora."""
+        if not self._leitura_ok:
+            return
+        if self._na_faixa():
+            self._fora = 0
+            if self._armado:
+                self._cnt += 1
+                if self._cnt >= GESTO_CONFIRMA_LEITURAS:
+                    self._cnt = 0
+                    self._armado = False
+                    self._pagina ^= 1
+        else:
+            self._cnt = 0
+            self._fora += 1
+            if self._fora >= GESTO_REARMA_LEITURAS:
+                self._armado = True
+
+    def _process_gesto(self):
+        """Nota de gesto: mesma fisica das trilhas; a mao na faixa na janela e acerto."""
+        if (self._leitura_ok and self._na_faixa() and self._gage != self.EMPTY
+                and abs(self._gage - self.HIT_AGE) <= self.HIT_WIN):
+            self._gage = self.EMPTY
+            self.score += 100 + self.combo
+            self.combo += 1
+            m = self._met
+            m["gestos_acert"] += 1
+            m["gestos_apres"] += 1
+            m["max_combo"] = max(m["max_combo"], min(self.combo, 255))
+
     def _edit_name(self, btn):
         """D/F trocam o caractere no cursor; J/K movem o cursor (nome_perfil.v)."""
         n = len(NAME_CHARS)
@@ -1016,6 +1365,8 @@ class SimulationEngine:
         self._cd_frame = 0
         self._chart_frame = 0
         self._ages = [[self.EMPTY] * self.SLOTS for _ in range(4)]
+        self._gage = self.EMPTY
+        self._met_cycles = 0
         self.score = 0
         self.misses = 0
         self.combo = 0
@@ -1023,12 +1374,19 @@ class SimulationEngine:
     # ── Logica de notas ──────────────────────────────────────────────────────
 
     def _advance_ages(self):
+        if self._gage != self.EMPTY:
+            self._gage += 1
         for track in self._ages:
             for i in range(self.SLOTS):
                 if track[i] != self.EMPTY:
                     track[i] += 1
 
     def _check_escapes(self):
+        if self._gage != self.EMPTY and self._gage > self.MISS_AGE:
+            self._gage = self.EMPTY
+            self.misses += 1
+            self.combo = 0
+            self._met["gestos_apres"] += 1  # apresentados = julgados (acerto + escape), como o RTL
         for t, track in enumerate(self._ages):
             for i in range(self.SLOTS):
                 if track[i] != self.EMPTY and track[i] > self.MISS_AGE:
@@ -1040,6 +1398,8 @@ class SimulationEngine:
     def _spawn_notes(self):
         if self._chart_frame < len(self._chart):
             mask = self._chart[self._chart_frame]
+            if mask & (1 << GESTO_BIT) and self._gage == self.EMPTY:
+                self._gage = 0
             for t in range(4):
                 if mask & (1 << t):
                     for i in range(self.SLOTS):
@@ -1128,6 +1488,20 @@ class Renderer:
         self.fpga_metrics = empty_metrics()  # acumuladores do metricas.v
         self.fpga_nome = NO_PROFILE  # nome do perfil (nome_perfil.v)
         self.fpga_cursor = 0
+        # Sensor, gesto, configuracao de jogo e metronomo (bytes 48-53 do pacote)
+        self.fpga_dist = 0
+        self.fpga_gesto_y = None  # Y da nota de gesto (None = nenhuma)
+        self.fpga_pagina = 0
+        self.fpga_progresso = 0
+        self.fpga_modo_met = 0
+        self.fpga_sensorial = False
+        self.fpga_sem_som = False
+        self.fpga_met_nivel = 3
+        self.fpga_met_lado = 0
+        self._prev_gestos = (0, 0)  # (apresentados, acertados) do pacote anterior
+        self._prev_gesto_y = None
+        self._met_disp = 0.0  # angulo mostrado no icone do metronomo (graus)
+        self._gesto_fx = []  # efeitos de acerto/erro da nota de gesto
 
         # Audio carregado no mixer: (musica, eq, previa). WAVs filtrados ficam
         # em memoria (nada e gravado em disco) num cache pequeno.
@@ -1151,6 +1525,7 @@ class Renderer:
             self._sim_t0 = None  # perf_counter do 1o passo da simulacao
             self._sim_steps = 0
             self._sim_btn = [False] * 5
+            self._sim_mao = False  # tecla G segurada = mao na faixa
         else:
             self.serial = SerialReader(port=serial_port, baudrate=baudrate)
             self.serial.start()
@@ -1163,6 +1538,7 @@ class Renderer:
         self._build_progress_gradient()
         self._build_score_backdrop()
         self._build_ghost_note_surfs()
+        self._build_gesto_surfs()
         self._build_song_previews()
         self._init_idle_anim()
         self._init_music()
@@ -1220,11 +1596,16 @@ class Renderer:
                 pygame.mixer.music.load(path)
             else:
                 pygame.mixer.music.load(source, "wav")
-            pygame.mixer.music.set_volume(0.70)
+            pygame.mixer.music.set_volume(self._music_volume())
             self._music_ok = True
             print(f"[music] Carregado: {path} eq={self._eq}{' (previa)' if preview else ''}")
         except Exception as e:
             print(f"[music] Falha ao carregar musica: {e}")
+
+    def _music_volume(self):
+        if self.fpga_sem_som:
+            return 0.0
+        return MUSIC_VOLUME * (0.5 if self.fpga_sensorial else 1.0)
 
     def _update_music(self, state):
         """Controla reproducao com base no estado do jogo."""
@@ -1236,6 +1617,9 @@ class Renderer:
             self._load_audio(preview=wanted[2])
         if not self._music_ok:
             return
+        # Sem som: so volume 0 (a musica segue tocando, o sync nao muda).
+        # Perfil sensorial: 50% do volume normal.
+        pygame.mixer.music.set_volume(self._music_volume())
         playing = pygame.mixer.music.get_busy()
         if state == STATE_SETTINGS:
             if not playing:
@@ -1418,6 +1802,8 @@ class Renderer:
 
     def _draw_idle_anim(self):
         """Atualiza e desenha a animacao de fundo da tela idle (Game of Life)."""
+        if self.fpga_sensorial:  # perfil sensorial: sem animacao de fundo
+            return
         ticks = pygame.time.get_ticks()
         if ticks - self._gol_last_update > self._gol_update_interval:
             self._update_gol()
@@ -1467,24 +1853,42 @@ class Renderer:
             if pkt is None:
                 break
             self.serial.request_ack()
-            self._prev_notes = [list(t) for t in self.fpga_notes]
-            self._prev_score = self.fpga_score
-            self._prev_combo = self.fpga_combo
-            self.fpga_state = pkt["state"]
-            self.fpga_countdown = pkt["countdown"]
-            self.fpga_notes = pkt["notes"]
-            self.fpga_score = pkt["score"]
-            self.fpga_misses = pkt["misses"]
-            self.fpga_combo = pkt["combo"]
-            self.fpga_frame_counter = pkt["frame_counter"]
-            # _update_music recarrega o audio se musica ou eq mudarem
-            self.fpga_song_id = pkt["song_id"]
-            self._selected_song = pkt["song_id"]
-            self._eq = pkt["eq"]
-            self.fpga_metrics = pkt["metrics"]
-            self.fpga_nome = pkt["nome"]
-            self.fpga_cursor = pkt["cursor"]
-            self._detect_note_events()
+            self._apply_pkt(pkt)
+
+    def _apply_pkt(self, pkt):
+        """Copia um pacote (FPGA ou simulacao) para o estado da interface."""
+        self._prev_notes = [list(t) for t in self.fpga_notes]
+        self._prev_score = self.fpga_score
+        self._prev_combo = self.fpga_combo
+        self._prev_gestos = (self.fpga_metrics["gestos_apres"], self.fpga_metrics["gestos_acert"])
+        self._prev_gesto_y = self.fpga_gesto_y
+        self.fpga_state = pkt["state"]
+        self.fpga_countdown = pkt["countdown"]
+        self.fpga_notes = pkt["notes"]
+        self.fpga_score = pkt["score"]
+        self.fpga_misses = pkt["misses"]
+        self.fpga_combo = pkt["combo"]
+        self.fpga_frame_counter = pkt["frame_counter"]
+        # _update_music recarrega o audio se musica ou eq mudarem
+        self.fpga_song_id = pkt["song_id"]
+        self._selected_song = pkt["song_id"]
+        self._eq = pkt["eq"]
+        self.fpga_metrics = {
+            k: (list(v) if isinstance(v, list) else v) for k, v in pkt["metrics"].items()
+        }
+        self.fpga_nome = pkt["nome"]
+        self.fpga_cursor = pkt["cursor"]
+        self.fpga_dist = pkt["dist_cm"]
+        self.fpga_gesto_y = pkt["gesto_y"]
+        self.fpga_pagina = pkt["pagina"]
+        self.fpga_progresso = pkt["progresso"]
+        self.fpga_modo_met = pkt["modo_met"]
+        self.fpga_sensorial = pkt["sensorial"]
+        self.fpga_sem_som = pkt["sem_som"]
+        self.fpga_met_nivel = pkt["met_nivel"]
+        self.fpga_met_lado = pkt["met_lado"]
+        self._detect_note_events()
+        self._detect_gesto_events()
 
     def _detect_note_events(self):
         """Detecta notas que sumiram e cria efeito de acerto ou erro."""
@@ -1519,7 +1923,11 @@ class Renderer:
             pygame.K_SPACE: 4,
         }
         for ev in events:
-            if ev.type == pygame.KEYDOWN and ev.key in key_map:
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_g:
+                self._sim_mao = True  # G segurada = mao na faixa do sensor
+            elif ev.type == pygame.KEYUP and ev.key == pygame.K_g:
+                self._sim_mao = False
+            elif ev.type == pygame.KEYDOWN and ev.key in key_map:
                 btn[key_map[ev.key]] = True
             # ESC em pausa = voltar ao menu (mesmo que btn[0]). So na pausa:
             # na tela inicial, btn[0] abriria as configuracoes.
@@ -1547,30 +1955,13 @@ class Renderer:
         if due <= 0:
             return
 
-        self._prev_notes = [list(t) for t in self.fpga_notes]
-        self._prev_score = self.fpga_score
-        self._prev_combo = self.fpga_combo
-
         # As teclas valem no ultimo passo, que corresponde ao instante atual
         for _ in range(due - 1):
-            self.sim.step([False] * 5)
-        pkt = self.sim.step(self._sim_btn)
+            self.sim.step([False] * 5, self._sim_mao)
+        pkt = self.sim.step(self._sim_btn, self._sim_mao)
         self._sim_btn = [False] * 5
         self._sim_steps += due
-        # _update_music recarrega o audio se musica ou eq mudarem
-        self._selected_song = pkt["song_id"]
-        self._eq = pkt["eq"]
-        self.fpga_state = pkt["state"]
-        self.fpga_countdown = pkt["countdown"]
-        self.fpga_notes = pkt["notes"]
-        self.fpga_score = pkt["score"]
-        self.fpga_misses = pkt["misses"]
-        self.fpga_combo = pkt["combo"]
-        self.fpga_frame_counter = pkt["frame_counter"]
-        self.fpga_metrics = pkt["metrics"]
-        self.fpga_nome = pkt["nome"]
-        self.fpga_cursor = pkt["cursor"]
-        self._detect_note_events()
+        self._apply_pkt(pkt)
 
     # ── Sessao: fecha ao fim da musica ────────────────────────────────────────
 
@@ -1601,6 +1992,8 @@ class Renderer:
             "misses": self.fpga_misses,
             # Sessao inteira vista? (a interface pode abrir com a musica no fim)
             "live": self._session_live,
+            "modo_met": self.fpga_modo_met,
+            "sensorial": self.fpga_sensorial,
             "name": None,
         }
         self._session_live = False
@@ -1624,7 +2017,8 @@ class Renderer:
                            False, now)
             return
         row = session_row(dash["metrics"], dash["profile"], dash["song"], dash["won"],
-                          dash["score"], dash["misses"])
+                          dash["score"], dash["misses"],
+                          modo_met=dash["modo_met"], sensorial=dash["sensorial"])
         ok, msg = self._log.append(row)
         who = dash["profile"] or "sem perfil"
         self._toast = (f"{msg}  ({who})", ok, now)
@@ -1633,6 +2027,17 @@ class Renderer:
 
     def _spawn_hit_effect(self, lane, x, y):
         """Cria burst de acerto: 3 aneis expansivos + 7 particulas + flash."""
+        if self.fpga_sensorial:
+            # Retorno minimo (LATENCIA_FEEDBACK): um anel fino que some em ~6 quadros
+            self._hit_effects.append(
+                {
+                    "lane": lane, "x": x, "y": y, "color": TRACK_COLORS[lane], "age": 0,
+                    "rings": [{"r": NOTE_RADIUS + 4, "alpha": 170, "delay": 0}],
+                    "particles": [], "flash_alpha": 0, "active": True,
+                    "grow": 1, "fade": 30, "width": 2,
+                }
+            )
+            return
         particles = []
         for i in range(7):
             angle = 2 * math.pi * i / 7 + random.uniform(-0.3, 0.3)
@@ -1677,8 +2082,8 @@ class Renderer:
             eff["flash_alpha"] = max(0, eff["flash_alpha"] - 30)
             for ring in eff["rings"]:
                 if eff["age"] >= ring["delay"]:
-                    ring["r"] += 6
-                    ring["alpha"] = max(0, ring["alpha"] - 12)
+                    ring["r"] += eff.get("grow", 6)
+                    ring["alpha"] = max(0, ring["alpha"] - eff.get("fade", 12))
             for p in eff["particles"]:
                 p["px"] += p["vx"]
                 p["py"] += p["vy"]
@@ -1718,6 +2123,8 @@ class Renderer:
         """Desenha a linha da hit zone (pulsante) e os indicadores de botao pixel art."""
         ticks = pygame.time.get_ticks()
         pulse = 0.5 + 0.5 * math.sin(ticks * 0.003)
+        if self.fpga_sensorial:
+            pulse = 0.5  # fixa
         b = int(80 + 80 * pulse)
         hit_col = (b // 2, b // 2, b)
 
@@ -1744,6 +2151,175 @@ class Renderer:
                         self.glow_surfs[i], (TRACK_X[i] - GLOW_CENTER, y - GLOW_CENTER)
                     )
 
+    # ── Nota de gesto (AVISO_GESTO) ───────────────────────────────────────────
+    # 5a "trilha": barra hexagonal magenta cobrindo as 4 trilhas, com uma mao
+    # desenhada. Forma e cor nao existem em nenhuma nota de trilha.
+
+    @staticmethod
+    def _gesto_geom():
+        x0 = TRACK_X[0] - TRACK_W // 2
+        x1 = TRACK_X[3] + TRACK_W // 2
+        return x0, x1, (x0 + x1) // 2
+
+    @staticmethod
+    def _draw_hand_icon(surf, cx, cy, h, fill, outline):
+        """Mao aberta (palma + 4 dedos + polegar) com primitivas; h = altura total."""
+        u = h / 10.0
+        parts = []
+        palm = pygame.Rect(0, 0, int(5.6 * u), int(4.4 * u))
+        palm.center = (cx, int(cy + 2.2 * u))
+        parts.append(("r", palm, int(1.2 * u)))
+        for k in range(4):
+            fh = (4.6, 5.4, 5.0, 4.0)[k] * u
+            fr = pygame.Rect(0, 0, max(2, int(1.15 * u)), int(fh))
+            fr.midbottom = (int(cx - 2.1 * u + k * 1.4 * u), int(cy + 0.6 * u))
+            parts.append(("r", fr, max(1, int(0.55 * u))))
+        thumb = pygame.Rect(0, 0, max(2, int(1.2 * u)), int(3.2 * u))
+        thumb.center = (int(cx - 3.3 * u), int(cy + 1.6 * u))
+        parts.append(("t", thumb, max(1, int(0.55 * u))))
+        for kind, r, rad in parts:  # contorno e depois miolo
+            grow = r.inflate(max(2, int(0.5 * u)), max(2, int(0.5 * u)))
+            if kind == "t":
+                pygame.draw.polygon(surf, outline, [
+                    (grow.right, grow.top), (grow.left - int(0.6 * u), grow.centery),
+                    (grow.left, grow.bottom), (grow.right, grow.bottom)])
+            else:
+                pygame.draw.rect(surf, outline, grow, border_radius=rad + 1)
+        for kind, r, rad in parts:
+            if kind == "t":
+                pygame.draw.polygon(surf, fill, [
+                    (r.right, r.top), (r.left - int(0.4 * u), r.centery),
+                    (r.left, r.bottom), (r.right, r.bottom)])
+            else:
+                pygame.draw.rect(surf, fill, r, border_radius=rad)
+
+    def _build_gesto_surfs(self):
+        x0, x1, _ = self._gesto_geom()
+        w = x1 - x0 + 2 * _px(12)
+        h = NOTE_RADIUS * 2 + _ps(16)
+        self.gesto_size = (w, h)
+        pad = _px(12)
+        bevel = h // 2 + _px(6)
+
+        def hexa(inset=0):
+            return [
+                (pad + inset, h // 2), (pad + bevel, inset), (w - pad - bevel, inset),
+                (w - pad - inset, h // 2), (w - pad - bevel, h - 1 - inset),
+                (pad + bevel, h - 1 - inset),
+            ]
+
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.polygon(s, (*GESTO_COR, 45), [(max(0, px - (6 if px < w // 2 else -6)), py)
+                                                  for px, py in hexa()], 0)
+        pygame.draw.polygon(s, (*GESTO_COR, 150), hexa(_ps(3)))
+        pygame.draw.polygon(s, GESTO_COR, hexa(_ps(6)))
+        pygame.draw.polygon(s, (255, 255, 255), hexa(_ps(6)), 2)
+        # setas laterais ( > < ) e a mao no centro
+        ay = h // 2
+        for sx, d in ((pad + bevel + _px(14), 1), (w - pad - bevel - _px(14), -1)):
+            for off in (0, _px(10)):
+                x = sx + d * off
+                pygame.draw.lines(s, (255, 255, 255), False,
+                                  [(x - d * _px(4), ay - _ps(9)), (x + d * _px(4), ay),
+                                   (x - d * _px(4), ay + _ps(9))], 3)
+        self._draw_hand_icon(s, w // 2, h // 2, int(h * 0.72),
+                             (255, 255, 255), (70, 10, 90))
+        self.gesto_surf = s
+        # Alvo na hit zone: so o contorno
+        t = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.polygon(t, (*GESTO_COR, 200), hexa(_ps(6)), 3)
+        self.gesto_target = t
+        # Versao "acesa" do alvo (mao na faixa dentro da janela)
+        o = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.polygon(o, (*GESTO_COR, 110), hexa(_ps(6)))
+        pygame.draw.polygon(o, (255, 255, 255, 230), hexa(_ps(6)), 3)
+        self.gesto_target_on = o
+
+    def _draw_gesto_note(self):
+        """Nota de gesto descendo ate a hit zone; o alvo (contorno) aparece junto."""
+        y = self.fpga_gesto_y
+        if y is None or self.fpga_state not in (STATE_PLAY, STATE_PAUSE):
+            return
+        w, h = self.gesto_size
+        _, _, cx = self._gesto_geom()
+        in_win = abs(y - HIT_Y) <= HIT_WIN * NOTE_SPEED
+        mao = FAIXA_MIN_CM <= self.fpga_dist <= FAIXA_MAX_CM
+        self.screen.blit(self.gesto_target_on if (in_win and mao) else self.gesto_target,
+                         (cx - w // 2, HIT_Y - h // 2))
+        if 0 <= y <= SCREEN_H + h:
+            self.screen.blit(self.gesto_surf, (cx - w // 2, y - h // 2))
+
+    def _detect_gesto_events(self):
+        """Gesto acertado (contador subiu) ou perdido (nota escapou): cria o efeito."""
+        if self.fpga_metrics["gestos_acert"] > self._prev_gestos[1]:
+            self._gesto_fx.append({"kind": "hit", "age": 0})
+        elif (self.fpga_state == STATE_PLAY and self.fpga_gesto_y is None
+              and self._prev_gesto_y is not None
+              and self._prev_gesto_y >= (MISS_AGE - 2) * NOTE_SPEED):
+            self._gesto_fx.append({"kind": "miss", "age": 0})
+
+    def _draw_gesto_effects(self):
+        """Acerto: barra se expande e some; erro: contorno vermelho que some."""
+        if not self._gesto_fx:
+            return
+        w, h = self.gesto_size
+        _, _, cx = self._gesto_geom()
+        calm = self.fpga_sensorial
+        life = 8 if calm else 30
+        self.scratch.fill((0, 0, 0, 0))
+        for fx in self._gesto_fx:
+            k = fx["age"] / life
+            alpha = int(255 * (1 - k) ** 2)
+            if fx["kind"] == "hit":
+                grow = 0 if calm else int(k * _px(40))
+                r = pygame.Rect(0, 0, w + 2 * grow, h + grow)
+                r.center = (cx, HIT_Y)
+                if not calm:
+                    pygame.draw.rect(self.scratch, (*GESTO_COR, alpha // 3), r,
+                                     border_radius=h // 2)
+                pygame.draw.rect(self.scratch, (*GESTO_COR, alpha), r,
+                                 2 if calm else 4, border_radius=h // 2)
+            else:
+                r = pygame.Rect(0, 0, w, h)
+                r.center = (cx, HIT_Y)
+                pygame.draw.rect(self.scratch, (255, 70, 70, alpha), r,
+                                 2 if calm else 4, border_radius=h // 2)
+                if not calm:
+                    d = h // 3
+                    for sg in (1, -1):
+                        pygame.draw.line(self.scratch, (255, 70, 70, alpha),
+                                         (cx - d, HIT_Y - sg * d), (cx + d, HIT_Y + sg * d), 5)
+            fx["age"] += 1
+        self.screen.blit(self.scratch, (0, 0))
+        self._gesto_fx = [f for f in self._gesto_fx if f["age"] < life]
+
+    # ── Metronomo no HUD ──────────────────────────────────────────────────────
+
+    def _draw_met_hud(self):
+        """Icone de metronomo: braco que alterna de lado a cada tempo (so se ligado)."""
+        if self.fpga_modo_met == 0:
+            return
+        cx, base_y = SCREEN_W - _px(46), _py(150)
+        calm = self.fpga_sensorial
+        target = 0.0
+        if not calm and self.fpga_met_nivel != 3:
+            ang = MET_ANGULOS[self.fpga_met_nivel] / 2
+            target = ang if self.fpga_met_lado else -ang
+        self._met_disp = target if calm else self._met_disp + (target - self._met_disp) * 0.4
+        col = (110, 150, 205) if calm else (255, 190, 80)
+        bw, bh = _ps(16), _ps(40)
+        body = [(cx - bw, base_y), (cx + bw, base_y), (cx + bw // 2, base_y - bh),
+                (cx - bw // 2, base_y - bh)]
+        pygame.draw.polygon(self.screen, (24, 36, 72), body)
+        pygame.draw.polygon(self.screen, col, body, 2)
+        rad = math.radians(self._met_disp)
+        arm = bh - _ps(4)
+        tip = (cx + math.sin(rad) * arm, base_y - _ps(2) - math.cos(rad) * arm)
+        pygame.draw.line(self.screen, col, (cx, base_y - _ps(2)), tip, 3)
+        pygame.draw.circle(self.screen, col, (int(tip[0]), int(tip[1])), _ps(4))
+        lab = self.font(16).render("TEMPO", True, (90, 125, 185))
+        self.screen.blit(lab, lab.get_rect(center=(cx, base_y + _ps(10))))
+
     def _draw_hit_effects(self):
         """Desenha burst de acerto: flash central, aneis e particulas."""
         self.scratch.fill((0, 0, 0, 0))
@@ -1769,7 +2345,8 @@ class Renderer:
             for ring in eff["rings"]:
                 if eff["age"] >= ring["delay"] and ring["alpha"] > 0:
                     pygame.draw.circle(
-                        self.scratch, (*color, ring["alpha"]), (x, y), ring["r"], 3
+                        self.scratch, (*color, ring["alpha"]), (x, y), ring["r"],
+                        eff.get("width", 3),
                     )
                     drawn = True
 
@@ -1799,6 +2376,8 @@ class Renderer:
 
         if combo >= 3:
             ticks = pygame.time.get_ticks()
+            if self.fpga_sensorial:
+                ticks = 0  # sem tremor do combo
             if combo >= 20:
                 size = 52
                 color = (255, 255, 200)
@@ -1860,18 +2439,18 @@ class Renderer:
 
         # Titulo 3D Arcade com glow pulsante e flutuacao
         ticks = pygame.time.get_ticks()
-        float_y = 6 * math.sin(ticks * 0.002)
+        float_y = 0 if self.fpga_sensorial else 6 * math.sin(ticks * 0.002)
 
         logo_rect = self._logo.get_rect(center=(SCREEN_W // 2, _py(190) + int(float_y)))
         self.screen.blit(self._logo, logo_rect)
 
-        if ticks % 1000 < 650:
+        if ticks % 1000 < 650 or self.fpga_sensorial:
             sub = self.font(50).render("Aperte START para jogar", True, (255, 130, 0))
             self.screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, _py(360))))
 
         # Fixo (sem piscar): entrada das configuracoes de som
         cfg = self.font(36).render(
-            "Aperte D / F / J / K para configurar o som", True, (140, 170, 220)
+            "Aperte D / F / J / K para configurar som e jogo", True, (140, 170, 220)
         )
         self.screen.blit(cfg, cfg.get_rect(center=(SCREEN_W // 2, _py(400))))
 
@@ -1917,8 +2496,9 @@ class Renderer:
                 per_bin = max(1, len(rom) / bins_n)
                 for f, v in enumerate(rom):
                     if v:
-                        preview["bins"][min(bins_n - 1, int(f / per_bin))] += bin(v).count("1")
-                        preview["notes"] += bin(v).count("1")
+                        n = bin(v & 0x0F).count("1")  # so notas de botao (bit 4 = gesto)
+                        preview["bins"][min(bins_n - 1, int(f / per_bin))] += n
+                        preview["notes"] += n
             except (OSError, ValueError):
                 preview = None
             self._song_previews.append(preview)
@@ -1933,7 +2513,7 @@ class Renderer:
         panel = pygame.Surface(rect.size, pygame.SRCALPHA)
         pygame.draw.rect(panel, (*TRACK_BG, 235), panel.get_rect(), border_radius=_ps(10))
         if avail:
-            pulse = 0.5 + 0.5 * math.sin(now * 0.004 + i * 0.9)
+            pulse = 0.5 if self.fpga_sensorial else 0.5 + 0.5 * math.sin(now * 0.004 + i * 0.9)
             pygame.draw.rect(panel, (*color, int(14 + 14 * pulse)), panel.get_rect(), border_radius=_ps(10))
         self.screen.blit(panel, rect.topleft)
 
@@ -2041,64 +2621,127 @@ class Renderer:
             hint_text = "[SIM]  D = Hobbit  |  F = Ocarina  |  J = Power Rangers  |  K = Pokemon  |  SPACE = Voltar"
         else:
             hint_text = "Aperte o botao da cor da musica para comecar"
-        if now % 1400 < 1000 or self._sim_mode:
+        if now % 1400 < 1000 or self._sim_mode or self.fpga_sensorial:
             hint = self.font(28).render(hint_text, True, (90, 135, 200))
             self.screen.blit(hint, hint.get_rect(center=(cx, box_top + box_h + _py(30))))
 
     def _draw_settings(self):
         """
-        Tela de configuracoes: uma coluna por faixa do atenuador, alinhada com a
-        trilha do botao que a controla. Estatica de proposito (sem piscar nem
+        Tela de configuracoes em duas abas ("Som" e "Jogo"), trocadas pelo gesto de
+        confirmacao (mao sobre o sensor ~1 s). Estatica de proposito (sem piscar nem
         pulsar): o publico-alvo inclui jogadores sensiveis a estimulos.
         """
         self.screen.fill(BG_COLOR)
         self._draw_bg_grid()
         self._draw_tracks(alpha=18)
         self.screen.blit(self.scanline_surf, (0, 0))
+        cx0 = SCREEN_W // 2
+        page = self.fpga_pagina
 
-        logo_rect = self._logo_select.get_rect(center=(SCREEN_W // 2, _py(55)))
-        self.screen.blit(self._logo_select, logo_rect)
-        title = self.font(52).render("CONFIGURAR SOM", True, (180, 220, 255))
-        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, _py(120))))
+        self.screen.blit(self._logo_select, self._logo_select.get_rect(center=(cx0, _py(36))))
+        title = self.font(46).render("CONFIGURACOES", True, (180, 220, 255))
+        self.screen.blit(title, title.get_rect(center=(cx0, _py(80))))
 
-        # Mesma grade de caixas da selecao de musica
-        BOX_W, BOX_H = _px(118), _py(270)
-        BOX_TOP = _py(155)
+        # Abas
+        TAB_W, TAB_H = _px(120), _py(30)
+        for k, name in enumerate(("Som", "Jogo")):
+            r = pygame.Rect(0, 0, TAB_W, TAB_H)
+            r.center = (cx0 + (k - 0.5) * (TAB_W + _px(12)), _py(116))
+            on = k == page
+            pygame.draw.rect(self.screen, (28, 48, 100) if on else (14, 22, 48), r, border_radius=6)
+            pygame.draw.rect(self.screen, (255, 130, 0) if on else LINE_COLOR, r,
+                             3 if on else 1, border_radius=6)
+            t = self.font(30).render(name, True, (235, 240, 255) if on else (100, 125, 175))
+            self.screen.blit(t, t.get_rect(center=r.center))
+
+        BOX_W, BOX_H = _px(118), _py(250)
+        BOX_TOP = _py(142)
         gap = _px(25)
-        total_w = 4 * BOX_W + 3 * gap
-        x_start = (SCREEN_W - total_w) // 2
+        x_start = (SCREEN_W - (4 * BOX_W + 3 * gap)) // 2
+        if page == 0:
+            self._draw_settings_som(x_start, BOX_W, BOX_H, BOX_TOP, gap)
+            legend = "Cada botao muda uma faixa:  " + " > ".join(
+                "0 dB" if k == 0 else f"-{EQ_STEP_DB * k}" for k in range(EQ_LEVELS)
+            ) + "  > 0 dB"
+        else:
+            self._draw_settings_jogo(x_start, BOX_W, BOX_H, BOX_TOP, gap)
+            legend = "D = metronomo   |   F = perfil sensorial   |   J = sem som"
+        info_y = BOX_TOP + BOX_H + _py(16)
+        info = self.font(28).render(legend, True, (160, 190, 235))
+        self.screen.blit(info, info.get_rect(center=(cx0, info_y)))
 
-        SEG_W, SEG_H, SEG_GAP = _px(60), _py(22), _py(6)
+        # Gesto de confirmacao: barra de progresso (0-7) e distancia atual
+        pw, ph = 4 * BOX_W + 3 * gap, _py(86)
+        panel = pygame.Rect(x_start, info_y + _py(16), pw, ph)
+        pygame.draw.rect(self.screen, (10, 18, 42), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (40, 75, 140), panel, 2, border_radius=8)
+        msg = self.font(24).render(
+            "Segure a mao sobre o sensor para trocar de aba", True, (200, 215, 245))
+        self.screen.blit(msg, msg.get_rect(midleft=(panel.x + _px(14), panel.y + _py(18))))
+        SEGS = 8
+        seg_gap = _px(5)
+        bar_w = int(pw * 0.58)
+        seg_w = (bar_w - (SEGS - 1) * seg_gap) // SEGS
+        bx, by = panel.x + _px(14), panel.y + _py(40)
+        for k in range(SEGS):
+            r = pygame.Rect(bx + k * (seg_w + seg_gap), by, seg_w, _py(26))
+            if k < self.fpga_progresso:
+                pygame.draw.rect(self.screen, GESTO_COR, r, border_radius=3)
+            else:
+                pygame.draw.rect(self.screen, (50, 60, 90), r, 1, border_radius=3)
+        d = self.fpga_dist
+        na_faixa = FAIXA_MIN_CM <= d <= FAIXA_MAX_CM
+        # Indicador de distancia: regua 0-40 cm com a faixa valida marcada
+        rx0, rx1 = bx + bar_w + _px(30), panel.right - _px(14)
+        ry = by + _py(13)
+        pygame.draw.line(self.screen, (60, 80, 130), (rx0, ry), (rx1, ry), 2)
+        fx0 = rx0 + (rx1 - rx0) * FAIXA_MIN_CM // 40
+        fx1 = rx0 + (rx1 - rx0) * FAIXA_MAX_CM // 40
+        pygame.draw.rect(self.screen, (*GESTO_COR,), (fx0, ry - _py(6), fx1 - fx0, _py(12)), 2)
+        if d > 0:
+            mx = rx0 + (rx1 - rx0) * min(d, 40) // 40
+            pygame.draw.circle(self.screen, (110, 220, 150) if na_faixa else (240, 170, 90),
+                               (mx, ry), _ps(6))
+        dist_txt = f"{d} cm" if d else "sem leitura"
+        dcol = (110, 220, 150) if na_faixa else (140, 170, 220)
+        dt = self.font(28).render(f"Distancia: {dist_txt}", True, dcol)
+        self.screen.blit(dt, dt.get_rect(midleft=(rx0, panel.y + _py(18))))
+        rng = self.font(20).render(f"faixa valida {FAIXA_MIN_CM} a {FAIXA_MAX_CM} cm", True, (90, 115, 160))
+        self.screen.blit(rng, rng.get_rect(midleft=(rx0, ry + _py(22))))
+
+        back = self.font(30).render("START = salvar e voltar", True, (255, 130, 0))
+        self.screen.blit(back, back.get_rect(center=(cx0, panel.bottom + _py(18))))
+        if self._sim_mode:
+            hint = self.font(24).render(
+                "[SIM]  D / F / J / K = opcoes   |   G (segurar) = mao no sensor   |   SPACE = voltar",
+                True, (55, 90, 150))
+            self.screen.blit(hint, hint.get_rect(center=(cx0, panel.bottom + _py(40))))
+
+    def _settings_box(self, i, x, w, h, top, color):
+        box = pygame.Rect(x - w // 2, top, w, h)
+        bg = pygame.Surface((w, h), pygame.SRCALPHA)
+        bg.fill((*color, 40))
+        self.screen.blit(bg, box.topleft)
+        pygame.draw.rect(self.screen, color, box, 2, border_radius=5)
+        key_s = self.font(40).render(TRACK_LABELS[i], True, color)
+        self.screen.blit(key_s, key_s.get_rect(center=(x, top + _py(24))))
+        pygame.draw.line(self.screen, color, (x - w // 2 + _px(10), top + _py(43)),
+                         (x + w // 2 - _px(10), top + _py(43)), 1)
+
+    def _draw_settings_som(self, x_start, BOX_W, BOX_H, BOX_TOP, gap):
+        SEG_W, SEG_H, SEG_GAP = _px(60), _py(20), _py(6)
         for i, band in enumerate(EQ_BANDS):
             cx = x_start + BOX_W // 2 + i * (BOX_W + gap)
             color = TRACK_COLORS[i]
             level = self._eq[i]
-            box_rect = pygame.Rect(cx - BOX_W // 2, BOX_TOP, BOX_W, BOX_H)
-
-            bg = pygame.Surface((BOX_W, BOX_H), pygame.SRCALPHA)
-            bg.fill((*color, 40))
-            self.screen.blit(bg, box_rect.topleft)
-            pygame.draw.rect(self.screen, color, box_rect, 2, border_radius=5)
-
-            key_s = self.font(40).render(TRACK_LABELS[i], True, color)
-            self.screen.blit(key_s, key_s.get_rect(center=(cx, BOX_TOP + _py(26))))
-            pygame.draw.line(
-                self.screen,
-                color,
-                (cx - BOX_W // 2 + _px(10), BOX_TOP + _py(46)),
-                (cx + BOX_W // 2 - _px(10), BOX_TOP + _py(46)),
-                1,
-            )
-
+            self._settings_box(i, cx, BOX_W, BOX_H, BOX_TOP, color)
             name_s = self.font(26).render(band["name"], True, (235, 240, 255))
-            self.screen.blit(name_s, name_s.get_rect(center=(cx, BOX_TOP + _py(64))))
+            self.screen.blit(name_s, name_s.get_rect(center=(cx, BOX_TOP + _py(60))))
             range_s = self.font(16).render(band["range"], True, (130, 175, 225))
-            self.screen.blit(range_s, range_s.get_rect(center=(cx, BOX_TOP + _py(84))))
-
+            self.screen.blit(range_s, range_s.get_rect(center=(cx, BOX_TOP + _py(79))))
             # Medidor: segmentos acesos = quanto da faixa ainda soa
-            # (4 = sem atenuacao, 1 = -18 dB)
             lit = EQ_LEVELS - level
-            seg_bottom = BOX_TOP + _py(220)
+            seg_bottom = BOX_TOP + _py(200)
             for k in range(EQ_LEVELS):
                 y = seg_bottom - (k + 1) * SEG_H - k * SEG_GAP
                 seg = pygame.Rect(cx - SEG_W // 2, y, SEG_W, SEG_H)
@@ -2106,27 +2749,36 @@ class Renderer:
                     pygame.draw.rect(self.screen, color, seg, border_radius=3)
                 else:
                     pygame.draw.rect(self.screen, (50, 60, 90), seg, 1, border_radius=3)
-
             db_text = "0 dB" if level == 0 else f"-{EQ_STEP_DB * level} dB"
             db_s = self.font(30).render(db_text, True, (235, 240, 255))
-            self.screen.blit(db_s, db_s.get_rect(center=(cx, BOX_TOP + _py(246))))
+            self.screen.blit(db_s, db_s.get_rect(center=(cx, BOX_TOP + _py(226))))
 
-        info_y = BOX_TOP + BOX_H + _py(24)
-        steps = " > ".join(
-            "0 dB" if k == 0 else f"-{EQ_STEP_DB * k}" for k in range(EQ_LEVELS)
-        )
-        info = self.font(30).render(
-            f"Cada botao muda uma faixa:  {steps}  > 0 dB", True, (160, 190, 235)
-        )
-        self.screen.blit(info, info.get_rect(center=(SCREEN_W // 2, info_y)))
-        back = self.font(30).render("START = salvar e voltar", True, (255, 130, 0))
-        self.screen.blit(back, back.get_rect(center=(SCREEN_W // 2, info_y + _py(26))))
-
-        if self._sim_mode:
-            hint = self.font(26).render(
-                "[SIM]  D / F / J / K = faixas   |   SPACE = voltar", True, (55, 90, 150)
-            )
-            self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, info_y + _py(52))))
+    def _draw_settings_jogo(self, x_start, BOX_W, BOX_H, BOX_TOP, gap):
+        met = ("Desligado", "Fixo")[1 if self.fpga_modo_met else 0]
+        itens = [
+            ("Metronomo", ("Desligado", "Fixo"), met),
+            ("Perfil sensorial", ("Lig", "Desl"), "Lig" if self.fpga_sensorial else "Desl"),
+            ("Sem som", ("Lig", "Desl"), "Lig" if self.fpga_sem_som else "Desl"),
+            ("Reservado", (), ""),
+        ]
+        for i, (nome, opcoes, atual) in enumerate(itens):
+            cx = x_start + BOX_W // 2 + i * (BOX_W + gap)
+            color = TRACK_COLORS[i] if opcoes else (60, 75, 115)
+            self._settings_box(i, cx, BOX_W, BOX_H, BOX_TOP, color)
+            lines = self._wrap_text(nome, 24, BOX_W - _px(12))
+            for n, ln in enumerate(lines):
+                t = self.font(24).render(ln, True, (235, 240, 255) if opcoes else (90, 105, 145))
+                self.screen.blit(t, t.get_rect(center=(cx, BOX_TOP + _py(62) + n * _py(18))))
+            for n, op in enumerate(opcoes):
+                r = pygame.Rect(0, 0, BOX_W - _px(24), _py(34))
+                r.center = (cx, BOX_TOP + _py(130) + n * _py(44))
+                on = op == atual
+                if on:
+                    pygame.draw.rect(self.screen, color, r, border_radius=5)
+                else:
+                    pygame.draw.rect(self.screen, (50, 60, 90), r, 1, border_radius=5)
+                t = self.font(28).render(op, True, BG_COLOR if on else (120, 140, 185))
+                self.screen.blit(t, t.get_rect(center=r.center))
 
     def _draw_countdown(self, sec):
         self.screen.fill(BG_COLOR)
@@ -2153,9 +2805,12 @@ class Renderer:
         self._draw_tracks()        # 2. trilhas + bordas verticais
         self._draw_notes(notes)    # 3. notas com glow
         self._draw_hit_zone()      # 4. linha pulsante + botoes
+        self._draw_gesto_note()    # 4b. nota de gesto (barra magenta com mao)
         self._advance_effects()    # 5. avanca estado dos efeitos
         self._draw_hit_effects()   # 6. burst de acerto: aneis + particulas + flash
+        self._draw_gesto_effects() # 6b. acerto/erro da nota de gesto
         self._draw_hud(score, misses, combo)  # 7. painel HUD
+        self._draw_met_hud()       # 7b. indicador do metronomo
         self.screen.blit(self.scanline_surf, (0, 0))  # 8. scanlines CRT
 
     def _draw_pause(self):
@@ -2169,7 +2824,7 @@ class Renderer:
 
         cx = SCREEN_W // 2
         ticks = pygame.time.get_ticks()
-        pulse = 0.5 + 0.5 * math.sin(ticks * 0.003)
+        pulse = 0.5 if self.fpga_sensorial else 0.5 + 0.5 * math.sin(ticks * 0.003)
 
         # Painel central
         pw, ph = _px(310), _py(430)
@@ -2317,8 +2972,10 @@ class Renderer:
 
         # ── Rodape ───────────────────────────────────────────────────────────
         y = prof_top + _py(120) + _py(16)
+        gm = dash["metrics"]
+        gtxt = f"Gestos {gm['gestos_acert']}/{gm['gestos_apres']}"
         self._dash_text(
-            "Gestos: ainda nao disponivel   |   Metronomo: ainda nao disponivel",
+            f"{gtxt}   |   Metronomo: tempo por nivel: Semana 4",
             20, self._DASH_MUTED, center=(cx, y),
         )
         start = "SPACE" if self._sim_mode else "START"
@@ -2544,7 +3201,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sim",
         action="store_true",
-        help="Modo simulacao: teclado (D/F/J/K=trilhas, SPACE=START), sem FPGA",
+        help="Modo simulacao: teclado (D/F/J/K=trilhas, SPACE=START, G=mao no sensor), sem FPGA",
     )
     parser.add_argument(
         "--audio-offset",

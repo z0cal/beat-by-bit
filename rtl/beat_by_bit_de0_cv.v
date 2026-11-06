@@ -14,7 +14,8 @@
  *   HEX0  -> estado da FSM
  *   HEX1  -> ultima jogada
  *   LEDR0-4 -> pulsos de debug
- *   GPIO_0_D0 -> uart_tx_out
+ *   GPIO_0_D0 -> uart_tx_out, D1 -> uart_rx_in
+ *   GPIO_0_D3 -> HC-SR04 TRIG, D5 -> ECHO, D7 -> servo (metronomo)
  *
  * Nota: DE0-CV tem apenas 4 KEYs; por isso so 2 trilhas sao jogaveis.
  *       O spawn foi limitado as trilhas 0 e 1 em fluxo_dados.v.
@@ -30,7 +31,11 @@ module beat_by_bit_de0_cv (
     output wire [6:0] HEX0,
     output wire [6:0] HEX1,
     output wire [9:0] LEDR,
-    output wire       GPIO_0_D0
+    output wire       GPIO_0_D0,
+    input  wire       GPIO_0_D1,   // uart_rx_in (ACK do PC)
+    output wire       GPIO_0_D3,   // hcsr04_trig
+    input  wire       GPIO_0_D5,   // hcsr04_echo
+    output wire       GPIO_0_D7    // servo_pwm
 );
 
     wire [4:0] botoes;
@@ -50,7 +55,11 @@ module beat_by_bit_de0_cv (
         .db_estado  (db_estado),
         .db_jogada  (db_jogada),
         .leds_pulsos(leds_pulsos),
-        .uart_tx_out(uart_tx_out)
+        .uart_tx_out(uart_tx_out),
+        .uart_rx_in (GPIO_0_D1),
+        .hcsr04_trig(GPIO_0_D3),
+        .hcsr04_echo(GPIO_0_D5),
+        .servo_pwm  (GPIO_0_D7)
     );
 
     assign HEX0      = db_estado;

@@ -32,7 +32,10 @@ module tb_nome_top;
         .leds_pulsos  (leds_pulsos),
         .db_botoes_raw(db_botoes_raw),
         .uart_tx_out  (uart_tx_out),
-        .uart_rx_in   (1'b1)
+        .uart_rx_in   (1'b1),
+        .hcsr04_trig  (),
+        .hcsr04_echo  (1'b0),
+        .servo_pwm    ()
     );
 
     defparam dut.u_fd.u_db_btn0.DEBOUNCE_CYCLES = 8;

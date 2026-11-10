@@ -11,6 +11,10 @@
  *             duracao da pausa).
  *   reinicia = 1 (nivel ou pulso, no COUNTDOWN/IDLE): recarrega a fase,
  *             zera o lado e o pulso. Deve valer antes de rodando subir.
+ *   comemora = 1 (tela de vitoria): o braco sobe e abana entre +55 e
+ *             +85 graus, trocando a cada 250 ms. Tem prioridade sobre o
+ *             tempo e independe de `modo`. SENTIDO_COMEMORA = 0 inverte
+ *             o lado, conforme a montagem do servo.
  *   modo    : 0 desligado, 1 fixo, 2 adaptativo (tratado como fixo
  *             nesta semana), 3 desligado.
  *   nivel_in: reservado para a S4 (adaptativo); hoje ignorado, nivel = 0.
@@ -37,12 +41,14 @@
  */
 
 module metronomo #(
-    parameter CLK_HZ = 50_000_000
+    parameter CLK_HZ = 50_000_000,
+    parameter SENTIDO_COMEMORA = 1      // 1: lado +; 0: lado -
 ) (
     input  wire        clock,
     input  wire        reset,
     input  wire        rodando,
     input  wire        reinicia,
+    input  wire        comemora,   // 1 na tela de vitoria
     input  wire [1:0]  modo,
     input  wire [1:0]  nivel_in,   // S4; ignorado nesta semana
     input  wire [31:0] periodo,    // ciclos por tempo
@@ -95,10 +101,36 @@ module metronomo #(
     localparam D1 = MEIA * 15 / 90;         // +-15 graus
     localparam D2 = MEIA * 75 / 900;        // +-7,5 graus
 
+    // Comemoracao: duas posicoes altas (abaixo de 90 graus, sem forcar o batente)
+    localparam D_BAIXA = MEIA * 55 / 90;
+    localparam D_ALTA  = MEIA * 85 / 90;
+    localparam L_BAIXA = SENTIDO_COMEMORA ? CENTRO + D_BAIXA : CENTRO - D_BAIXA;
+    localparam L_ALTA  = SENTIDO_COMEMORA ? CENTRO + D_ALTA  : CENTRO - D_ALTA;
+    localparam T_ABANO = CLK_HZ / 4;        // 250 ms por posicao
+
+    reg [23:0] abano_cnt;
+    reg        abano_baixo;
+
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            abano_cnt   <= 24'd0;
+            abano_baixo <= 1'b0;
+        end else if (!comemora) begin
+            abano_cnt   <= 24'd0;
+            abano_baixo <= 1'b0;
+        end else if (abano_cnt == T_ABANO - 1) begin
+            abano_cnt   <= 24'd0;
+            abano_baixo <= ~abano_baixo;
+        end else
+            abano_cnt <= abano_cnt + 24'd1;
+    end
+
     reg [19:0] largura;
     always @(*) begin
         largura = CENTRO[19:0];
-        if (rodando && ligado) begin
+        if (comemora) begin
+            largura = abano_baixo ? L_BAIXA[19:0] : L_ALTA[19:0];
+        end else if (rodando && ligado) begin
             case (nivel)
                 2'd0: largura = lado ? CENTRO[19:0] + D0[19:0] : CENTRO[19:0] - D0[19:0];
                 2'd1: largura = lado ? CENTRO[19:0] + D1[19:0] : CENTRO[19:0] - D1[19:0];

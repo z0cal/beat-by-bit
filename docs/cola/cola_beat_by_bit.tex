@@ -70,6 +70,7 @@ Conferir o pino 1 do conector pela marcação da placa.
   \conector{JP1}{7.4}{JP1 · GPIO\_0}
   \node[saida] at (JP1-1) {};
   \node[sig] at (JP1-2) {};
+  \node[saida] at (JP1-4) {};  \node[sig] at (JP1-6) {};  \node[saida] at (JP1-8) {};
   \node[gnd] at (JP1-12) {};  \node[gnd] at (JP1-30) {};
   \node[pwr] at (JP1-29) {};
   \node[sig] at (JP1-16) {};
@@ -81,13 +82,16 @@ Conferir o pino 1 do conector pela marcação da placa.
 
   \esq{JP1-1}{1 · \s{uart\_tx\_out} $\to$ RXD do CP2102}
   \esq{JP1-11}{11 · 5\,V da placa: \textbf{não usar}}
-  \esq{JP1-29}{29 · 3,3\,V $\to$ trilho $+$ dos pull-ups (\textbf{nunca 5\,V})}
+  \esq{JP1-29}{29 · 3,3\,V $\to$ trilho $+$: pull-ups e HC-SR04 (\textbf{nunca 5\,V})}
   \esq{JP1-37}{37 · \s{botoes[1]} · trilha 1}
   \esq{JP1-39}{39 · \s{botoes[0]} · trilha 0}
   \dir{JP1-2}{2 · \s{uart\_rx\_in} $\leftarrow$ TXD do CP2102}
+  \dir{JP1-4}{4 · \s{hcsr04\_trig} $\to$ TRIG do HC-SR04}
+  \dir{JP1-6}{6 · \s{hcsr04\_echo} $\leftarrow$ ECHO do HC-SR04}
+  \dir{JP1-8}{8 · \s{servo\_pwm} $\to$ sinal do servo}
   \dir{JP1-12}{12 · GND $\to$ GND do CP2102}
   \dir{JP1-16}{16 · \s{reset} (apertado = reset)}
-  \dir{JP1-30}{30 · GND $\to$ trilho $-$ dos botões}
+  \dir{JP1-30}{30 · GND $\to$ trilho $-$ (GND comum)}
   \dir{JP1-36}{36 · \s{botoes[4]} · START / PAUSE}
   \dir{JP1-38}{38 · \s{botoes[3]} · trilha 3}
   \dir{JP1-40}{40 · \s{botoes[2]} · trilha 2}
@@ -137,16 +141,29 @@ dá curto.
 FPGA) e GND no pino 12. O 3V3 e o 5V do CP2102 ficam livres (ele é alimentado pelo USB).
 Com o jogo rodando no PC, \textbf{LEDR3 aceso} confirma a serial nos dois sentidos.
 
+\textbf{HC-SR04.} Quatro fios: VCC no trilho $+$ (3,3\,V, \textbf{nunca 5\,V}), GND no
+trilho $-$, TRIG no pino 4 e ECHO no pino 6. Alimentado a 3,3\,V, o ECHO liga direto no
+GPIO, sem divisor de tensão.
+
+\textbf{Servo (SG90).} Alimentado pela \textbf{fonte externa de 5\,V}, nunca pela placa:
+fio vermelho no $+$ da fonte, marrom no $-$ da fonte e laranja (sinal) no pino 8. Ligar
+o $-$ da fonte ao trilho $-$ (GND comum, senão o sinal não tem referência). O $+$ da
+fonte \textbf{não} encosta no trilho $+$ de 3,3\,V nem em nenhum pino do JP1.
+Na música ele marca o tempo; na vitória, levanta e abana até sair da tela.
+
 \begin{tabularx}{\linewidth}{@{}l l l l Y@{}}
 \toprule
 Sinal & Pino JP1 & Pino FPGA & Liga em & Função \\
 \midrule
 \s{uart\_tx\_out} & 1  & N16 & RXD do CP2102          & pacotes de 22\,B a 115\,200 baud, 60 por segundo \\
 \s{uart\_rx\_in}  & 2  & B16 & TXD do CP2102          & ACK do PC (0xA5 a cada 0,25\,s) acende LEDR3 \\
+\s{hcsr04\_trig}  & 4  & C16 & TRIG do HC-SR04        & dispara a medição de distância \\
+\s{hcsr04\_echo}  & 6  & K20 & ECHO do HC-SR04        & pulso proporcional à distância (direto, sem divisor) \\
+\s{servo\_pwm}    & 8  & K22 & sinal do servo         & PWM de 50\,Hz do metrônomo (servo na fonte externa) \\
 GND               & 12 & --- & GND do CP2102          & referência comum \\
 \s{reset}         & 16 & T22 & botão $+$ pull-up      & apertado (0 no pino) zera o jogo para IDLE \\
-3,3\,V            & 29 & --- & trilho $+$             & alimenta os 6 pull-ups \\
-GND               & 30 & --- & trilho $-$             & uma perna de cada botão \\
+3,3\,V            & 29 & --- & trilho $+$             & alimenta os 6 pull-ups e o VCC do HC-SR04 \\
+GND               & 30 & --- & trilho $-$             & botões, GND do HC-SR04 e $-$ da fonte do servo \\
 \s{botoes[4]}     & 36 & T20 & botão $+$ pull-up      & START / PAUSE \\
 \s{botoes[1]}     & 37 & T19 & botão $+$ pull-up      & trilha 1 · música 1 (Song of Storms) \\
 \s{botoes[3]}     & 38 & T18 & botão $+$ pull-up      & trilha 3 \\

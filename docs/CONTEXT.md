@@ -230,6 +230,9 @@ pc/diag_serial.py --port <porta>` (conta bytes, pacotes válidos e estados visto
 - **Metrônomo** (`metronomo.v` + `servo_pwm.v`): período e fase em ciclos de 50 MHz vindos de
   `rtl/bpm_params.vh` (gerado por `gerar_hex.py`; suporta uma troca de andamento: Pokémon 192→136 BPM
   no tempo 40). Braço ±30° no modo fixo, centro fora do PLAY/pausa/desligado. PWM 50 Hz, 1–2 ms.
+  Na tela de vitória o mesmo servo comemora: abana entre +55° e +85° a cada 250 ms, mesmo com o
+  metrônomo desligado (`SENTIDO_COMEMORA` inverte o lado conforme a montagem). Substitui o robô
+  separado da spec de 19/10.
 - **PC**: barra de energia vertical ao lado da pista (brilha mais quando há movimento) + medidor da
   mão ao vivo (acende em 5–30 cm); no x2, trilhas/bordas douradas e selo `"x2"` com tempo restante;
   perfil sensorial = música a 50% e versão calma sem piscar nem partículas (só cor e barra); sem som

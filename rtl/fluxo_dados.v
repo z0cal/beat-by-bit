@@ -537,9 +537,12 @@ module fluxo_dados #(
 
     wire met_reinicia = (db_estado == 4'b0000) || (db_estado == 4'b0110) || (db_estado == 4'b0001);
 
+    // Na tela de vitoria o mesmo servo comemora (END_WIN = 4)
+    wire met_comemora = (db_estado == 4'b0100);
+
     metronomo u_metronomo (
         .clock(clock), .reset(reset),
-        .rodando(game_active), .reinicia(met_reinicia),
+        .rodando(game_active), .reinicia(met_reinicia), .comemora(met_comemora),
         .modo(modo_met), .nivel_in(2'd0),
         .periodo(met_periodo), .fase(met_fase),
         .periodo2(met_periodo2), .ntroca(met_ntroca),

@@ -12,6 +12,8 @@
  *   5. modo 0 e 3: sem pulsos, nivel = 3, braco no centro
  *   6. modo 2 tratado como fixo
  *   7. Largura do PWM: centro, +A, -A conforme lado/rodando/modo
+ *   8. comemora: abana entre +55 e +85 graus, mesmo com modo desligado,
+ *      tem prioridade sobre o tempo e volta ao centro ao terminar
  *-----------------------------------------------------------------------
  */
 `timescale 1ns/1ps
@@ -24,11 +26,16 @@ module tb_metronomo;
     localparam D0      = (CLK_HZ / 2000) * 30 / 90;
     localparam PERIODO = 1000;
     localparam FASE    = 300;
+    localparam MEIA    = CLK_HZ / 2000;
+    localparam L_BAIXA = CENTRO + MEIA * 55 / 90;
+    localparam L_ALTA  = CENTRO + MEIA * 85 / 90;
+    localparam T_ABANO = CLK_HZ / 4;
 
     reg         clock = 0;
     reg         reset = 1;
     reg         rodando = 0;
     reg         reinicia = 0;
+    reg         comemora = 0;
     reg  [1:0]  modo = 2'd1;
     reg  [1:0]  nivel_in = 2'd2;
     reg  [31:0] periodo = PERIODO;
@@ -39,7 +46,7 @@ module tb_metronomo;
     wire [1:0]  nivel;
 
     metronomo #(.CLK_HZ(CLK_HZ)) dut (
-        .clock(clock), .reset(reset), .rodando(rodando), .reinicia(reinicia),
+        .clock(clock), .reset(reset), .rodando(rodando), .reinicia(reinicia), .comemora(comemora),
         .modo(modo), .nivel_in(nivel_in), .periodo(periodo), .fase(fase), .periodo2(periodo2), .ntroca(ntroca),
         .tempo_pulso(tempo_pulso), .lado(lado), .nivel(nivel), .servo(servo)
     );
@@ -55,7 +62,7 @@ module tb_metronomo;
     reg     esperado_lado = 0;
 
     // Monitor de tempos: o k-esimo pulso vem com ecount == FASE + k*PERIODO
-    reg rodando_d, lado_d, tempo_d;
+    reg rodando_d, lado_d, tempo_d, comemora_d;
     reg [1:0] modo_d, nivel_d;
     always @(posedge clock) begin
         if (reinicia) begin
@@ -85,16 +92,25 @@ module tb_metronomo;
     // Monitor do PWM: largura medida == esperada pelo estado no latch
     reg servo_d = 0;
     integer wcnt = 0, wexp = 0, nchk = 0, n_mais = 0, n_menos = 0, n_cen = 0;
+    integer n_alta = 0, n_baixa = 0, n_outra = 0, ultima = 0;
     always @(posedge clock) begin
         if (servo && !servo_d) begin
             wcnt = 1;
-            if (rodando_d && (modo_d == 2'd1 || modo_d == 2'd2))
+            if (comemora_d)
+                wexp = 0;                // conferido pelas contagens n_alta/n_baixa
+            else if (rodando_d && (modo_d == 2'd1 || modo_d == 2'd2))
                 wexp = lado_d ? CENTRO + D0 : CENTRO - D0;
             else
                 wexp = CENTRO;
         end else if (servo)
             wcnt = wcnt + 1;
         else if (servo_d) begin
+            ultima = wcnt;
+            if (wexp == 0) begin
+                if (wcnt == L_ALTA) n_alta = n_alta + 1;
+                else if (wcnt == L_BAIXA) n_baixa = n_baixa + 1;
+                else n_outra = n_outra + 1;
+            end
             if (wexp != 0) nchk = nchk + 1;
             if (wexp != 0 && wcnt !== wexp) begin
                 $display("[FAIL] largura PWM %0d (esp %0d)", wcnt, wexp);
@@ -105,7 +121,7 @@ module tb_metronomo;
             else n_menos = n_menos + 1;
         end
         servo_d <= servo;
-        rodando_d <= rodando; lado_d <= lado; modo_d <= modo; nivel_d <= nivel;
+        rodando_d <= rodando; lado_d <= lado; modo_d <= modo; nivel_d <= nivel; comemora_d <= comemora;
     end
 
     task ciclos;
@@ -213,6 +229,31 @@ module tb_metronomo;
         rodando = 0;
         reinicia_pulso;                          // zera o contador de tempos
         periodo2 = PERIODO; ntroca = 32'hFFFFFFFF;
+
+        // 8: comemoracao com o metronomo desligado e fora do PLAY
+        modo = 2'd0; rodando = 0;
+        comemora = 1;
+        ciclos(2 * PER_SRV);
+        n_alta = 0; n_baixa = 0; n_outra = 0;
+        pulsos_proibidos = 1;
+        ciclos(3 * T_ABANO + T_ABANO / 2);
+        confere(n_alta > 0 && n_baixa > 0, "20. abana entre as duas posicoes altas");
+        confere(n_outra == 0, "21. so as larguras de +55 e +85 graus");
+        confere(n_alta >= 20 && n_baixa >= 20, "22. ritmo de 250 ms por posicao");
+        pulsos_proibidos = 0;
+
+        // prioridade sobre o metronomo em andamento
+        modo = 2'd1; rodando = 1;
+        ciclos(2 * PER_SRV);
+        n_alta = 0; n_baixa = 0; n_outra = 0;
+        ciclos(T_ABANO + 2 * PER_SRV);
+        confere(n_outra == 0 && n_alta + n_baixa > 0, "23. comemora tem prioridade sobre o tempo");
+        rodando = 0; modo = 2'd0;
+
+        // fim da tela de vitoria: volta ao centro
+        comemora = 0;
+        ciclos(3 * PER_SRV);
+        confere(ultima == CENTRO, "24. volta ao centro ao sair da vitoria");
 
         confere(nchk > 10, "15. PWM medido varias vezes");
         $display("---");

@@ -130,14 +130,17 @@ set_location_assignment PIN_L1 -to db_botoes_raw[4]
 set_location_assignment PIN_T22 -to reset
 set_location_assignment PIN_N16 -to uart_tx_out
 set_location_assignment PIN_B16 -to uart_rx_in
-# Semana 3: HC-SR04 e servo no JP1 (GPIO_0_D3 = pino 4, D5 = pino 6, D7 = pino 8)
+# Semana 3: HC-SR04 e servo no JP1 (GPIO_0_D3 = pino 4, D5 = pino 6, D7 = pino 8). Servo na fonte externa, so o sinal vem da FPGA.
 set_location_assignment PIN_C16 -to hcsr04_trig
 set_location_assignment PIN_K20 -to hcsr04_echo
 set_location_assignment PIN_K22 -to servo_pwm
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to hcsr04_trig
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to hcsr04_echo
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to servo_pwm
+# DE0-CV: todos os bancos de I/O em 3,3 V (sem isto os demais pinos ficam em 2,5 V e conflitam no banco 5B).
+set_global_assignment -name STRATIX_DEVICE_IO_STANDARD "3.3-V LVTTL"
 
-set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 # Pino solto oscila e mantem o jogo em reset (nenhum pacote UART sai).
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to reset
+
+set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

@@ -2603,14 +2603,10 @@ class Renderer:
         x = _px(18)
         self._text("SCORE", F_HINT, T_HINT, topleft=(x, _py(14)))
         self._text(f"{score:06d}", 60, T_MAIN, topleft=(x, _py(30)))
-        self._text("ERROS", F_HINT, T_HINT, topleft=(x, _py(78)))
-        pw, ph, pg = _px(8), _py(8), _px(3)
-        for k in range(MAX_MISSES):
-            pip = pygame.Rect(x + k * (pw + pg), _py(98), pw, ph)
-            if k < misses:
-                pygame.draw.rect(self.screen, C_BAD, pip, border_radius=2)
-            else:
-                pygame.draw.rect(self.screen, PANEL_LINE, pip, 2, border_radius=2)
+        # Erros como numero: na FPGA nao ha limite de erros (perdeu = 0), entao
+        # marcas de "vidas" prometeriam uma derrota que nao acontece
+        self._inline([("ERROS ", T_HINT), (str(misses), T_SUB)], F_SMALL,
+                     topleft=(x, _py(78)))
 
         # Combo na margem direita, espelhando o score
         if combo >= 3:

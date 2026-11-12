@@ -38,7 +38,8 @@ FPGA (Verilog) ──UART 921600───► Python (Pygame)
     sequencial `taxa_acerto.v`), sem zeros à esquerda; fora do END, HEX0 = estado,
     HEX1 = jogada, HEX2 apagado. Porta nova `db_hex2` no top (pinos Y19…AB21, mesma ordem
     de bits do HEX0/HEX1: `[0]` = segmento `a`).
-  - **Perfil estilo arcade** (`nome_perfil.v`, dentro do `fluxo_dados`): no dashboard a
+  - **Perfil estilo arcade** (`nome_perfil.v`, dentro do `fluxo_dados`): START no dashboard
+    leva à tela do nome (estado `NOME` = 8 da UC, `tb_uc_nome.v`), onde a
     criança escolhe 3 caracteres (`-`, A–Z, 0–9) com os botões: D/F = caractere
     anterior/próximo (37 valores, dá a volta), J/K = cursor para esquerda/direita (para nas
     pontas). START salva e volta à tela inicial. O nome fica guardado até o reset da FPGA
@@ -323,7 +324,7 @@ Presets `_DIFF_PRESETS`: `(min_lane_spacing, global_spacing, max_simultaneous)`.
 | `note_track.v` | 1 trilha com 3 slots de nota; `hit_age` = idade da nota acertada |
 | `metricas.v` | Acumuladores da sessão: N, Σe, Σ\|e\|, Σe², notas/acertos por trilha, maior combo |
 | `taxa_acerto.v` | Divisor sequencial: taxa de acerto em % e dígitos para o HEX |
-| `nome_perfil.v` | Nome do perfil em 3 caracteres, editado com D/F/J/K no fim da música |
+| `nome_perfil.v` | Nome do perfil em 3 caracteres, editado com D/F/J/K na tela do nome (estado `NOME`) |
 | `debounce_pulse.v` | Debounce + detecção de borda |
 | `contador_m.v` | Contador parametrizável |
 

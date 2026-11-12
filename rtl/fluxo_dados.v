@@ -23,7 +23,7 @@
  *     acerto, notas e acertos por trilha e maior combo. Zera em
  *     COUNTDOWN e fica congelado em PAUSE, END e IDLE
  *   - Nome do perfil em estilo arcade (nome_perfil.v), editado pelos
- *     botoes de trilha no fim de musica (END_WIN/END_LOSE)
+ *     botoes de trilha na tela do nome (estado NOME, apos o fim de musica)
  *-----------------------------------------------------------------------
  * Clock assumido: 50 MHz
  *   frame_tick: M = 833_333 ciclos (= 50MHz / 60fps)
@@ -237,12 +237,12 @@ module fluxo_dados #(
 
     // ----------------------------------------------------------------
     // Nome do perfil: D/F trocam o caractere, J/K movem o cursor, so no
-    // fim de musica (db_estado == 4 ou 5)
+    // na tela do nome, depois do fim de musica (db_estado == 8)
     // ----------------------------------------------------------------
     nome_perfil u_nome (
         .clock   (clock),
         .reset   (reset),
-        .habilita((db_estado == 4'b0100) || (db_estado == 4'b0101)),
+        .habilita(db_estado == 4'b1000),
         .pulso   (btn_pulse),
         .nome    (nome_out),
         .cursor  (nome_cursor)

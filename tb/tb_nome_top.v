@@ -5,7 +5,8 @@
  * Os botoes passam pelo debounce real (encurtado por defparam) e o estado
  * da FSM e forcado:
  *   1. Em PLAY os botoes nao mexem no nome
- *   2. No fim de musica: F, F, K, F monta "BA-" -> c0=2, c1=1
+ *   2. No fim de musica (END_WIN) os botoes tambem nao mexem no nome
+ *      Na tela do nome (NOME): F, F, K, F monta "BA-" -> c0=2, c1=1
  *   3. Cursor chega ao packet_sender
  *   4. Voltar a IDLE zera o cursor e mantem o nome
  *-----------------------------------------------------------------------
@@ -90,6 +91,11 @@ module tb_nome_top;
         confere(18'd0, 2'd0, "1. PLAY nao mexe no nome");
 
         force dut.s_estado = 4'b0100;   // END_WIN
+        aperta(1);
+        aperta(3);
+        confere(18'd0, 2'd0, "2. END_WIN nao mexe no nome");
+
+        force dut.s_estado = 4'b1000;   // NOME
         aperta(1); aperta(1);           // c0: '-' -> A -> B
         aperta(3);                      // cursor 1
         aperta(1);                      // c1: A

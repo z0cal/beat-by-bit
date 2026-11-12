@@ -263,8 +263,10 @@ module beat_by_bit #(
     hexa7seg u_hex_d (.hex(s_taxa_d), .seg(seg_d));
     hexa7seg u_hex_u (.hex(s_taxa_u), .seg(seg_u));
 
-    // Fim de musica: 0100 = END_WIN, 0101 = END_LOSE
-    wire       fim_musica = (s_estado == 4'b0100) || (s_estado == 4'b0101);
+    // Fim de musica: 0100 = END_WIN, 0101 = END_LOSE e 1000 = NOME (tela do
+    // perfil, logo depois): a taxa de acerto fica no display ate voltar a IDLE
+    wire       fim_musica = (s_estado == 4'b0100) || (s_estado == 4'b0101) ||
+                            (s_estado == 4'b1000);
     localparam [6:0] APAGADO = 7'b1111111;   // segmentos ativos em 0
 
     assign db_estado = fim_musica ? seg_u : seg_estado;

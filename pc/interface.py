@@ -7,7 +7,7 @@ Protocolo UART (921600 baud, 8N1; --baud muda):
   Pacote de 56 bytes a ~60fps (multibyte em big-endian):
     [0]  0x55              marcador de inicio
     [1]  {eq_lo, state}    state (bits 3:0): 0=IDLE 1=COUNTDOWN 2=PLAY 3=PAUSE
-                           4=WIN 5=LOSE 6=SELECT 7=SETTINGS
+                           4=WIN 5=LOSE 6=SELECT 7=SETTINGS 8=NOME
                            bits 5:4 = GRAVES, bits 7:6 = MEDIOS
     [2]  {eq_hi, countdown} countdown (bits 3:0): 3,2,1,0
                            bits 5:4 = AGUDOS, bits 7:6 = BRILHO
@@ -29,7 +29,7 @@ Protocolo UART (921600 baud, 8N1; --baud muda):
     [30-32] soma de e^2
     [33-44] por trilha t, 3 bytes a partir de 33+3t: {notas[t], acertos[t]}
             (12 bits cada; notas = notas julgadas, acerto ou nota perdida)
-    --- nome do perfil (nome_perfil.v), editado no fim de musica ---
+    --- nome do perfil (nome_perfil.v), editado na tela do nome (estado 8) ---
     [45]    {cursor[1:0], c0}  c0 = caractere da esquerda
     [46]    c1
     [47]    c2                 caractere: 0='-', 1..26='A'..'Z', 27..36='0'..'9'
@@ -161,6 +161,24 @@ TRACK_BG = (12, 20, 48)
 LINE_COLOR = (30, 55, 110)
 HIT_LINE_COL = (55, 100, 180)
 
+# Identidade da interface: tres niveis de texto (principal, apoio, dica), um
+# unico destaque (laranja, so para a acao da tela) e um so estilo de painel.
+T_MAIN = (236, 242, 255)
+T_SUB = (150, 176, 220)
+T_HINT = (112, 136, 184)
+ACCENT = (255, 130, 0)
+C_OK = (110, 225, 160)
+C_WARN = (240, 170, 90)
+C_BAD = (255, 95, 95)
+# Bonus x2: branco-quente, longe do amarelo da trilha D e do laranja da acao
+C_BONUS = (255, 234, 175)
+C_BONUS_CALM = (222, 206, 160)  # perfil sensorial
+C_DATA = (176, 200, 242)  # dado agregado no fim de sessao (neutro: nao e cor de trilha)
+PANEL_BG = (11, 18, 40)
+PANEL_LINE = (30, 48, 92)
+# Tamanhos de fonte (base 800x600): numero principal, titulo, corpo, apoio, dica
+F_HERO, F_TITLE, F_BODY, F_SMALL, F_HINT = 110, 56, 34, 26, 22
+
 MAX_MISSES = 10  # derrota ao atingir este numero de erros (igual a 'perdeu' em Verilog)
 
 # Estados da FPGA (devem ser iguais aos estados da UC em Verilog)
@@ -172,6 +190,7 @@ STATE_WIN = 4
 STATE_LOSE = 5
 STATE_SONG_SELECT = 6
 STATE_SETTINGS = 7
+STATE_NAME = 8  # tela do nome do perfil, depois do fim de musica
 
 # Caminhos resolvidos a partir deste arquivo (independe do diretorio atual)
 _PC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -244,7 +263,6 @@ PKT_FOOTER = 0xAA
 ACK_BYTE = 0xA5
 ACK_INTERVAL = 0.25  # s; a FPGA apaga o LED apos 1 s sem ACK
 EMPTY_SLOT = 0xFF
-GESTO_COR = (230, 70, 255)  # cor da barra de confirmacao nas configuracoes
 FAIXA_MIN_CM, FAIXA_MAX_CM = 5, 25  # faixa do gesto de confirmacao (gesto_detector.v)
 GESTO_CONFIRMA_LEITURAS = 16  # leituras seguidas na faixa que trocam a pagina
 GESTO_REARMA_LEITURAS = 4  # leituras seguidas fora da faixa que rearmam
@@ -1297,11 +1315,14 @@ class SimulationEngine:
                 self.state = STATE_PLAY
         elif self.state in (STATE_WIN, STATE_LOSE):
             if start:
+                self.state = STATE_NAME
+        elif self.state == STATE_NAME:
+            if start:
                 self.state = STATE_IDLE
                 self._reset()
             else:
                 self._edit_name(btn)
-        if self.state not in (STATE_WIN, STATE_LOSE):
+        if self.state != STATE_NAME:
             self._cursor = 0
 
     def _sensor(self, mao, mov):
@@ -1517,6 +1538,7 @@ class Renderer:
         pygame.display.set_caption("Beat by Bit" + (" [SIM]" if sim_mode else ""))
         self.clock = pygame.time.Clock()
         self._font_cache = {}
+        self._key_dots = {}  # miniaturas dos botoes das trilhas (_key_dot)
 
         # Estado recebido da FPGA (ou simulado)
         self.fpga_state = STATE_IDLE
@@ -1584,8 +1606,7 @@ class Renderer:
         self._build_scanline_surf()
         self._build_bg_grid_surf()
         self._build_vignette_surf()
-        self._build_progress_gradient()
-        self._build_score_backdrop()
+        self._build_progress_bar()
         self._build_ghost_note_surfs()
         self._build_energia_surfs()
         self._build_song_previews()
@@ -1598,10 +1619,7 @@ class Renderer:
         # Sao pixel art: escala por multiplo inteiro (sem suavizacao) para manter os pixels nitidos.
         img_dir = os.path.join(_ASSETS_DIR, "images")
         logo = pygame.image.load(os.path.join(img_dir, "logo-escuro-1x.png")).convert_alpha()
-        icon = pygame.image.load(os.path.join(img_dir, "icone-1x.png")).convert_alpha()
         self._logo = _scale_pixel_art(logo, int(SCREEN_W * 0.30))
-        self._logo_select = _scale_pixel_art(icon, _ps(50))
-        self._logo_pause = _scale_pixel_art(logo, int(SCREEN_W * 0.14))
 
     # ── Musica ────────────────────────────────────────────────────────────────
 
@@ -1806,54 +1824,30 @@ class Renderer:
         """Pre-renderiza overlay de scanlines CRT (linhas escuras a cada 2px)."""
         self.scanline_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         for row in range(0, SCREEN_H, 2):
-            pygame.draw.rect(self.scanline_surf, (0, 0, 0, 60), (0, row, SCREEN_W, 1))
+            pygame.draw.rect(self.scanline_surf, (0, 0, 0, 36), (0, row, SCREEN_W, 1))
 
     def _build_bg_grid_surf(self):
         """Pre-renderiza grid horizontal sutil no fundo."""
         self.bg_grid_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         for y in range(0, SCREEN_H, _py(40)):
             pygame.draw.line(
-                self.bg_grid_surf, (20, 40, 90, 255), (0, y), (SCREEN_W, y), 1
+                self.bg_grid_surf, (14, 24, 54, 255), (0, y), (SCREEN_W, y), 1
             )
 
     def _build_vignette_surf(self):
-        """Pre-renderiza overlay de vignette (bordas escuras para dar profundidade)."""
+        """Pre-renderiza a vinheta: escurece os cantos em elipse, sem degraus."""
         self.vignette_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        steps = 55
-        step_px = min(SCREEN_W, SCREEN_H) // (2 * steps)
-        for i in range(steps):
-            ratio = 1.0 - i / steps
-            alpha = int(145 * ratio ** 1.8)
-            margin = i * step_px
-            thick = max(1, step_px + 2)
-            pygame.draw.rect(
-                self.vignette_surf,
-                (0, 0, 0, alpha),
-                (margin, margin, SCREEN_W - 2 * margin, SCREEN_H - 2 * margin),
-                thick,
-            )
+        nx = np.linspace(-1.0, 1.0, SCREEN_W)[:, None]
+        ny = np.linspace(-1.0, 1.0, SCREEN_H)[None, :]
+        d = np.sqrt((nx * nx + ny * ny) / 2.0)  # 0 no centro, 1 nos cantos
+        alpha = pygame.surfarray.pixels_alpha(self.vignette_surf)
+        alpha[:] = (100 * d ** 3).astype(np.uint8)
+        del alpha  # libera o lock da surface
 
-    def _build_progress_gradient(self):
-        """Pre-renderiza gradiente laranja→azul para a barra de progresso."""
+    def _build_progress_bar(self):
+        """Dimensoes da barra de progresso da musica."""
         self._prog_bw = SCREEN_W - _px(40)
-        self._prog_bh = max(4, _py(8))
-        self._progress_grad = pygame.Surface((self._prog_bw, self._prog_bh))
-        for x in range(self._prog_bw):
-            t = x / max(1, self._prog_bw - 1)
-            r = int(255 * (1 - t))
-            g = int(110 * (1 - t) + 140 * t)
-            bv = int(255 * t)
-            pygame.draw.line(self._progress_grad, (r, g, bv), (x, 0), (x, self._prog_bh - 1))
-
-    def _build_score_backdrop(self):
-        """Pre-renderiza painel escuro atras do HUD de score."""
-        self.score_backdrop = pygame.Surface((260, 76), pygame.SRCALPHA)
-        pygame.draw.rect(
-            self.score_backdrop, (0, 0, 0, 150), (0, 0, 260, 76), border_radius=6
-        )
-        pygame.draw.rect(
-            self.score_backdrop, (40, 80, 170, 180), (0, 0, 260, 76), 1, border_radius=6
-        )
+        self._prog_bh = max(3, _py(5))
 
     def _build_ghost_note_surfs(self):
         """Versao fantasma das notas para a animacao da tela idle."""
@@ -2119,7 +2113,7 @@ class Renderer:
         """
         if state == STATE_PLAY:
             self._session_live = True
-        if state in (STATE_WIN, STATE_LOSE):
+        if state in (STATE_WIN, STATE_LOSE, STATE_NAME):
             if self._dash is None:
                 self._dash = self._open_dash(won=(state == STATE_WIN))
             self._refresh_profile()
@@ -2246,48 +2240,66 @@ class Renderer:
         self.screen.blit(self.bg_grid_surf, (0, 0))
 
     def _build_track_surfaces(self):
-        """Pre-renderiza colunas das trilhas (normal, pausa, menu e x2 dourado)."""
+        """Pre-renderiza colunas das trilhas (jogo, pausa e menu)."""
         self._track_surfs = {}
-        for alpha in (255, 50, 18):
-            if alpha == 255:
-                s = pygame.Surface((TRACK_W, SCREEN_H)).convert()
-                s.fill(TRACK_BG)
-            else:
-                s = pygame.Surface((TRACK_W, SCREEN_H), pygame.SRCALPHA)
-                s.fill((*TRACK_BG, alpha))
+        for alpha in (50, 18):
+            s = pygame.Surface((TRACK_W, SCREEN_H), pygame.SRCALPHA)
+            s.fill((*TRACK_BG, alpha))
             self._track_surfs[alpha] = s
-        self._track_surf_x2 = pygame.Surface((TRACK_W, SCREEN_H)).convert()
-        self._track_surf_x2.fill((38, 30, 10))
-        self._track_surf_x2_calm = pygame.Surface((TRACK_W, SCREEN_H)).convert()
-        self._track_surf_x2_calm.fill((26, 23, 12))
+        # No jogo cada trilha tem um degrade vertical fixo: escura no topo, mais
+        # clara e levemente tingida da sua cor perto da linha de acerto, para
+        # levar o olho ate o alvo. Estatico: vale tambem no perfil sensorial.
+        self._track_play = [self._track_gradient(TRACK_BG, c) for c in TRACK_COLORS]
+        # Versao do x2: a mesma trilha com a cor propria mais forte. Entra e sai
+        # aos poucos por cima da normal (ver _draw_tracks), sem repintar a pista.
+        self._track_x2 = [self._track_gradient(TRACK_BG, c, 0.2) for c in TRACK_COLORS]
+        self._x2_mix = 0.0  # 0 = trilha normal, 1 = cor do x2 no maximo
+
+    @staticmethod
+    def _track_gradient(base, tint=None, strength=0.07):
+        """Coluna de trilha: brilho 0.55 no topo -> 1.45 na linha de acerto -> 0.8 embaixo."""
+        s = pygame.Surface((TRACK_W, SCREEN_H)).convert()
+        for y in range(SCREEN_H):
+            if y <= HIT_Y:
+                t = (y / HIT_Y) ** 2  # sobe devagar e concentra o brilho no alvo
+                k = 0.55 + 0.9 * t
+            else:
+                t = 1.0 - (y - HIT_Y) / max(1, SCREEN_H - HIT_Y)
+                k = 0.8 + 0.65 * t
+            col = [min(255, c * k) for c in base]
+            if tint:
+                col = [c + strength * t * tc for c, tc in zip(col, tint)]
+            pygame.draw.line(s, [min(255, int(c)) for c in col], (0, y), (TRACK_W, y))
+        return s
 
     def _draw_tracks(self, alpha=255):
-        x2 = (
-            alpha == 255
-            and self.fpga_state == STATE_PLAY
-            and self.fpga_x2_ativo
-        )
-        if x2:
+        # No x2 cada trilha fica com a propria cor um pouco mais forte, em
+        # transicao suave (~0,4 s; mais fraca e mais lenta no perfil sensorial)
+        boost = 0.0
+        if alpha == 255:
+            surfs = self._track_play
+            on = self.fpga_state == STATE_PLAY and self.fpga_x2_ativo
             calm = self.fpga_sensorial
-            surf = self._track_surf_x2_calm if calm else self._track_surf_x2
-            if calm:
-                bcol = (205, 170, 65)
-            else:
-                pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.006)
-                bcol = (255, int(195 + 45 * pulse), int(45 + 45 * pulse))
-            bw = 2
+            target = (0.5 if calm else 1.0) if on else 0.0
+            step = 0.02 if calm else 0.04
+            self._x2_mix += max(-step, min(step, target - self._x2_mix))
+            boost = self._x2_mix
         else:
             surf = self._track_surfs.get(alpha)
             if surf is None:
                 surf = pygame.Surface((TRACK_W, SCREEN_H), pygame.SRCALPHA)
                 surf.fill((*TRACK_BG, alpha))
-            bcol = LINE_COLOR if alpha == 255 else (*LINE_COLOR, alpha)
-            bw = 1
+            surfs = [surf] * 4
+        bcol = LINE_COLOR if alpha == 255 else (*LINE_COLOR, alpha)
+        bw = 1
 
-        for x in TRACK_X:
+        for i, (x, surf) in enumerate(zip(TRACK_X, surfs)):
             x0 = x - TRACK_W // 2
             x1 = x + TRACK_W // 2
             self.screen.blit(surf, (x0, 0))
+            if boost > 0:
+                self._track_x2[i].set_alpha(int(255 * boost))
+                self.screen.blit(self._track_x2[i], (x0, 0))
             pygame.draw.line(self.screen, bcol, (x0, 0), (x0, SCREEN_H), bw)
             pygame.draw.line(self.screen, bcol, (x1, 0), (x1, SCREEN_H), bw)
 
@@ -2297,22 +2309,20 @@ class Renderer:
         calm = self.fpga_sensorial
         pulse = 0.5 if calm else 0.5 + 0.5 * math.sin(ticks * 0.003)
         if self.fpga_state == STATE_PLAY and self.fpga_x2_ativo:
-            if calm:
-                hit_col = (195, 160, 60)
-            else:
-                hit_col = (
-                    int(190 + 60 * pulse),
-                    int(150 + 55 * pulse),
-                    int(35 + 40 * pulse),
-                )
+            # Linha de acerto na cor do bonus (mesmo pulso suave da linha normal)
+            k = 0.8 if calm else 0.7 + 0.3 * pulse
+            hit_col = tuple(int(c * k) for c in (C_BONUS_CALM if calm else C_BONUS))
         else:
             b = int(80 + 80 * pulse)
             hit_col = (b // 2, b // 2, b)
 
+        # A linha cobre so as trilhas; as margens ficam livres para o HUD
+        lx0 = TRACK_X[0] - TRACK_W // 2
+        lx1 = TRACK_X[-1] + TRACK_W // 2
         for offset, a in [(3, 40), (2, 80), (1, 160), (0, 255)]:
             color = (*hit_col, a) if offset else hit_col
             pygame.draw.line(
-                self.screen, color, (0, HIT_Y + offset), (SCREEN_W, HIT_Y + offset), 1
+                self.screen, color, (lx0, HIT_Y + offset), (lx1, HIT_Y + offset), 1
             )
 
         size = self.btn_size
@@ -2374,14 +2384,14 @@ class Renderer:
         for key, fill, outline in (
             ("off", (90, 115, 160), (22, 34, 68)),
             ("on", (115, 245, 175), (16, 70, 52)),
-            ("x2", (255, 220, 85), (80, 55, 10)),
+            ("x2", C_BONUS, (84, 70, 36)),
         ):
             s = pygame.Surface((sz, sz), pygame.SRCALPHA)
             self._draw_hand_icon(s, sz // 2, sz // 2, ih, fill, outline)
             self._hand_icons[key] = s
 
     def _draw_energia_hud(self):
-        """Barra de energia vertical, medidor da mao (5-30 cm) e selo x2."""
+        """Barra de energia vertical, indicador da mao (5-30 cm) e selo x2."""
         calm = self.fpga_sensorial
         x2 = self.fpga_x2_ativo
         ener = max(0, min(ENERGIA_MAX, self.fpga_energia))
@@ -2390,156 +2400,50 @@ class Renderer:
         mov = self._mov_boost > 0 and not x2
         if self.fpga_state == STATE_PLAY and self._mov_boost > 0:
             self._mov_boost -= 1
+        gold = C_BONUS_CALM if calm else C_BONUS
 
-        # Painel lateral a esquerda da trilha 0
-        panel = pygame.Rect(_px(18), _py(96), _px(100), _py(448))
-        pygame.draw.rect(self.screen, (10, 18, 42), panel, border_radius=8)
-        if x2:
-            pborder = (210, 175, 65) if calm else (255, 210, 60)
-        elif mov and not calm:
-            pborder = (95, 235, 255)
-        else:
-            pborder = (38, 72, 140)
-        pygame.draw.rect(self.screen, pborder, panel, 2, border_radius=8)
-
-        tcol = (245, 215, 110) if x2 else (175, 215, 255)
-        ttl = self.font(22).render("ENERGIA", True, tcol)
-        self.screen.blit(ttl, ttl.get_rect(center=(panel.centerx, _py(113))))
-
-        # ── Coluna esquerda: barra vertical de energia (0..255) ──────────────
-        bx, bw = _px(30), _px(34)
-        by0, bh = _py(130), _py(306)
-        by1 = by0 + bh
-        bar_bg = pygame.Rect(bx, by0, bw, bh)
-        pygame.draw.rect(self.screen, (16, 26, 56), bar_bg, border_radius=5)
-
+        # ── Barra de energia (0..255) na margem esquerda ─────────────────────
+        x = _px(18)
+        self._text("ENERGIA", F_HINT, gold if x2 else T_HINT, topleft=(x, _py(128)))
+        bar = pygame.Rect(x, _py(150), _px(26), _py(330))
+        rad = _ps(5)
+        pygame.draw.rect(self.screen, PANEL_BG, bar, border_radius=rad)
         if ener > 0:
-            fh = max(3, int(bh * ener / ENERGIA_MAX))
-            frect = pygame.Rect(bx + 2, by1 - fh, bw - 4, fh)
+            fh = max(3, bar.h * ener // ENERGIA_MAX)
             if x2:
-                fcol = (215, 175, 60) if calm else (255, 205, 50)
+                fcol = gold
             elif mov:
                 fcol = (75, 200, 225) if calm else (95, 245, 255)
             else:
-                fcol = (40, 165, 205) if calm else (25, 165, 235)
-            pygame.draw.rect(self.screen, fcol, frect, border_radius=4)
-            if not calm and fh > 6:
-                cap = (255, 245, 180) if x2 else ((235, 255, 255) if mov else (130, 220, 255))
-                pygame.draw.rect(
-                    self.screen, cap, (bx + 3, by1 - fh, bw - 6, max(2, _py(3))),
-                    border_radius=2,
-                )
-
-        # Marcas de 25%, 50%, 75%
-        for k in (1, 2, 3):
-            ty = by1 - bh * k // 4
-            pygame.draw.line(self.screen, (30, 50, 95), (bx + 2, ty), (bx + bw - 3, ty), 1)
-
-        if mov and not calm:
-            pygame.draw.rect(self.screen, (140, 250, 255), bar_bg.inflate(4, 4), 2, border_radius=6)
-        pygame.draw.rect(
-            self.screen,
-            (215, 175, 65) if (x2 and calm) else ((255, 215, 70) if x2 else (55, 95, 165)),
-            bar_bg,
-            2,
-            border_radius=5,
-        )
-
-        pct_str = "x2" if x2 else f"{100 * ener // ENERGIA_MAX}%"
-        pct_s = self.font(20).render(
-            pct_str, True, (245, 210, 95) if x2 else (145, 185, 235)
-        )
-        self.screen.blit(pct_s, pct_s.get_rect(center=(bx + bw // 2, _py(451))))
-
-        # ── Coluna direita: medidor ao vivo da mao (0..40 cm; 5-30 acende) ───
-        gx, gw = _px(76), _px(28)
-        gy0, gh = by0, bh
-        gy1 = gy0 + gh
-        g_bg = pygame.Rect(gx, gy0, gw, gh)
-        pygame.draw.rect(self.screen, (14, 24, 50), g_bg, border_radius=5)
-
-        zy1 = gy1 - gh * ENERGIA_DIST_MIN // 40
-        zy0 = gy1 - gh * ENERGIA_DIST_MAX // 40
-        zrect = pygame.Rect(gx + 2, zy0, gw - 4, zy1 - zy0)
-        if mao_ok:
+                fcol = (40, 150, 200) if calm else (25, 165, 235)
             pygame.draw.rect(
-                self.screen, (26, 88, 70) if calm else (30, 108, 84), zrect, border_radius=3
+                self.screen, fcol, (bar.x, bar.bottom - fh, bar.w, fh), border_radius=rad
             )
-            pygame.draw.rect(
-                self.screen, (95, 215, 160) if calm else (110, 245, 175), zrect, 2, border_radius=3
-            )
+        if x2:
+            line = gold
+        elif mov and not calm:
+            line = (140, 250, 255)  # movimento da mao: a barra enche mais rapido
         else:
-            pygame.draw.rect(self.screen, (20, 36, 68), zrect, border_radius=3)
-            pygame.draw.rect(self.screen, (50, 82, 132), zrect, 1, border_radius=3)
+            line = PANEL_LINE
+        pygame.draw.rect(self.screen, line, bar, 2, border_radius=rad)
 
-        pygame.draw.rect(self.screen, (50, 82, 132), g_bg, 1, border_radius=5)
-
-        if d > 0:
-            my = gy1 - gh * min(d, 40) // 40
-            mcol = (115, 245, 175) if mao_ok else (240, 170, 90)
-            pygame.draw.line(self.screen, mcol, (gx + 2, my), (gx + gw - 3, my), 3)
-            pygame.draw.circle(self.screen, mcol, (gx + gw // 2, my), _ps(4))
-
-        mao_lbl = self.font(20).render(
-            "MAO", True, (115, 235, 170) if mao_ok else (120, 150, 195)
-        )
-        self.screen.blit(mao_lbl, mao_lbl.get_rect(center=(gx + gw // 2, _py(451))))
-
-        # ── Rodape do painel: icone da mao + distancia ao vivo ───────────────
-        pygame.draw.line(
-            self.screen, (30, 55, 110), (panel.x + _px(8), _py(466)), (panel.right - _px(8), _py(466)), 1
-        )
+        # ── Mao no sensor: icone aceso na faixa valida + distancia ───────────
+        hx = bar.right + _px(36)
         ikey = "x2" if (x2 and mao_ok) else ("on" if mao_ok else "off")
         hicon = self._hand_icons[ikey]
-        self.screen.blit(hicon, hicon.get_rect(center=(_px(37), _py(505))))
-
-        dist_str = f"{d} cm" if d > 0 else "-- cm"
-        dcol = (115, 240, 170) if mao_ok else (130, 160, 205)
-        ds = self.font(25).render(dist_str, True, dcol)
-        self.screen.blit(ds, ds.get_rect(midleft=(_px(54), _py(493))))
-
-        if mov:
-            sub_str, sub_col = "MOV +RAPIDO", (110, 235, 255) if not calm else (120, 190, 215)
-        elif mao_ok:
-            sub_str, sub_col = "5-30 cm OK", (95, 205, 150)
-        else:
-            sub_str, sub_col = "5 a 30 cm", (90, 118, 165)
-        ss = self.font(17).render(sub_str, True, sub_col)
-        self.screen.blit(ss, ss.get_rect(midleft=(_px(54), _py(518))))
-
+        self.screen.blit(hicon, hicon.get_rect(center=(hx, bar.bottom - _py(40))))
+        self._text(f"{d} cm" if d > 0 else "-- cm", F_HINT,
+                   C_OK if mao_ok else T_HINT, center=(hx, bar.bottom - _py(10)))
         if self._sim_mode:
-            sim_h = self.font(16).render("[G] mao  [H] mexer", True, (65, 100, 160))
-            self.screen.blit(sim_h, sim_h.get_rect(center=(panel.centerx, _py(556))))
+            self._text("G  mao parada", F_HINT, T_HINT, topleft=(x, bar.bottom + _py(6)))
+            self._text("H  mao mexendo", F_HINT, T_HINT, topleft=(x, bar.bottom + _py(22)))
 
-        # ── Selo x2 no topo central (entre as trilhas 1 e 2) ─────────────────
+        # ── Selo x2 no topo central (vao entre as trilhas 1 e 2) ─────────────
         if x2:
-            badge = pygame.Rect(0, 0, _px(108), _py(62))
-            badge.center = (SCREEN_W // 2, _py(44))
-            if not calm:
-                pygame.draw.rect(
-                    self.screen, (120, 90, 18), badge.inflate(8, 8), 2, border_radius=12
-                )
-            pygame.draw.rect(self.screen, (38, 28, 8), badge, border_radius=9)
-            bcol = (215, 175, 65) if calm else (255, 215, 65)
-            pygame.draw.rect(self.screen, bcol, badge, 3 if not calm else 2, border_radius=9)
-
-            x2_s = self.font(54).render("x2", True, (235, 195, 85) if calm else (255, 230, 95))
-            self.screen.blit(x2_s, x2_s.get_rect(midleft=(badge.x + _px(10), badge.centery - _py(4))))
-
+            cx = SCREEN_W // 2
+            self._text("x2", 84, gold, center=(cx, _py(40)))
             rest_s = ener * (DURACAO_X2 / FPS) / ENERGIA_MAX
-            tm_s = self.font(28).render(f"{rest_s:.1f}s", True, (245, 235, 200))
-            self.screen.blit(tm_s, tm_s.get_rect(midright=(badge.right - _px(10), badge.y + _py(21))))
-            pt_s = self.font(18).render("PONTOS", True, (205, 175, 95))
-            self.screen.blit(pt_s, pt_s.get_rect(midright=(badge.right - _px(10), badge.y + _py(40))))
-
-            # Mini-barra do tempo restante na base do selo
-            mb_w = badge.w - _px(16)
-            mb_x = badge.x + _px(8)
-            mb_y = badge.bottom - _py(9)
-            pygame.draw.rect(self.screen, (22, 18, 8), (mb_x, mb_y, mb_w, _py(4)), border_radius=2)
-            mfill = int(mb_w * ener / ENERGIA_MAX)
-            if mfill > 0:
-                pygame.draw.rect(self.screen, bcol, (mb_x, mb_y, mfill, _py(4)), border_radius=2)
+            self._text(f"{rest_s:.1f} s", F_SMALL, T_SUB, center=(cx, _py(76)))
 
     # ── Metronomo no HUD ──────────────────────────────────────────────────────
 
@@ -2547,26 +2451,24 @@ class Renderer:
         """Icone de metronomo: braco que alterna de lado a cada tempo (so se ligado)."""
         if self.fpga_modo_met == 0:
             return
-        cx, base_y = SCREEN_W - _px(46), _py(150)
+        cx, base_y = SCREEN_W - _px(42), _py(150)
         calm = self.fpga_sensorial
         target = 0.0
         if not calm and self.fpga_met_nivel != 3:
             ang = MET_ANGULOS[self.fpga_met_nivel] / 2
             target = ang if self.fpga_met_lado else -ang
         self._met_disp = target if calm else self._met_disp + (target - self._met_disp) * 0.4
-        col = (110, 150, 205) if calm else (255, 190, 80)
+        col = T_HINT if calm else T_SUB
         bw, bh = _ps(16), _ps(40)
         body = [(cx - bw, base_y), (cx + bw, base_y), (cx + bw // 2, base_y - bh),
                 (cx - bw // 2, base_y - bh)]
-        pygame.draw.polygon(self.screen, (24, 36, 72), body)
-        pygame.draw.polygon(self.screen, col, body, 2)
+        pygame.draw.polygon(self.screen, PANEL_BG, body)
+        pygame.draw.polygon(self.screen, PANEL_LINE, body, 2)
         rad = math.radians(self._met_disp)
         arm = bh - _ps(4)
         tip = (cx + math.sin(rad) * arm, base_y - _ps(2) - math.cos(rad) * arm)
         pygame.draw.line(self.screen, col, (cx, base_y - _ps(2)), tip, 3)
         pygame.draw.circle(self.screen, col, (int(tip[0]), int(tip[1])), _ps(4))
-        lab = self.font(16).render("TEMPO", True, (90, 125, 185))
-        self.screen.blit(lab, lab.get_rect(center=(cx, base_y + _ps(10))))
 
     def _draw_hit_effects(self):
         """Desenha burst de acerto: flash central, aneis e particulas."""
@@ -2610,57 +2512,114 @@ class Renderer:
         if drawn:
             self.screen.blit(self.scratch, (0, 0))
 
-    def _draw_hud(self, score, misses, combo):
-        self.screen.blit(self.score_backdrop, (8, 8))
+    # ── Blocos de interface ───────────────────────────────────────────────────
+    # Toda tela usa os mesmos tres niveis de texto (T_MAIN, T_SUB, T_HINT), um
+    # so estilo de painel e o rodape como unico lugar das instrucoes.
 
-        score_txt = self.font(36).render(f"SCORE  {score:06d}", True, (180, 220, 255))
-        self.screen.blit(score_txt, (_px(20), _py(16)))
+    def _text(self, text, size, color, **pos):
+        surf = self.font(size).render(text, True, color)
+        rect = surf.get_rect(**pos)
+        self.screen.blit(surf, rect)
+        return rect
 
-        miss_color = (255, 80, 80) if misses > 5 else (100, 160, 220)
-        miss_txt = self.font(28).render(
-            f"ERROS {misses}", True, miss_color
-        )
-        self.screen.blit(miss_txt, (_px(20), _py(52)))
+    def _panel(self, rect, line=PANEL_LINE):
+        bg = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(bg, (*PANEL_BG, 235), bg.get_rect(), border_radius=_ps(8))
+        self.screen.blit(bg, rect.topleft)
+        pygame.draw.rect(self.screen, line, rect, 2, border_radius=_ps(8))
 
-        if combo >= 3:
-            ticks = pygame.time.get_ticks()
-            if self.fpga_sensorial:
-                ticks = 0  # sem tremor do combo
-            if combo >= 20:
-                size = 52
-                color = (255, 255, 200)
-                shadow = (180, 120, 0)
-                wobble = int(3 * math.sin(ticks * 0.015))
-            elif combo >= 10:
-                size = 44
-                color = (255, 160, 0)
-                shadow = None
-                wobble = int(2 * math.sin(ticks * 0.01))
+    def _key_dot(self, i, r=None):
+        """Botao da trilha em miniatura (cor; tecla so no --sim), para citar botoes no texto."""
+        r = r or _ps(10)
+        if (i, r) not in self._key_dots:
+            s = pygame.Surface((2 * r, 2 * r), pygame.SRCALPHA)
+            pygame.draw.circle(s, TRACK_COLORS[i], (r, r), r)
+            if self._sim_mode:  # a tecla so interessa na simulacao por teclado
+                lab = self.font(int(2.6 * r / SS)).render(TRACK_LABELS[i], True, BG_COLOR)
+                s.blit(lab, lab.get_rect(center=(r, r + max(1, r // 8))))
+            self._key_dots[(i, r)] = s
+        return self._key_dots[(i, r)]
+
+    def _keys(self, idx=(0, 1, 2, 3), r=None):
+        return [self._key_dot(i, r) for i in idx]
+
+    def _inline(self, parts, size, color=T_HINT, **pos):
+        """Linha com trechos de cores diferentes: str, (str, cor) ou Surface."""
+        surfs = []
+        for p in parts:
+            if isinstance(p, pygame.Surface):
+                surfs.append(p)
             else:
-                size = 36
-                color = (255, 170, 0)
-                shadow = None
-                wobble = 0
-
-            combo_txt = self.font(size).render(f"COMBO x{combo}", True, color)
-            base_rect = combo_txt.get_rect(
-                topright=(SCREEN_W - _px(20) + wobble, _py(16))
-            )
-            if shadow:
-                shadow_surf = self.font(size).render(f"COMBO x{combo}", True, shadow)
-                self.screen.blit(shadow_surf, (base_rect.x + 2, base_rect.y + 2))
-            self.screen.blit(combo_txt, base_rect)
-
-        if self._sim_mode:
-            status_color = (255, 180, 0)
-            status_label = "SIM"
-        else:
-            status_color = (0, 255, 100) if self.serial.connected else (100, 100, 100)
-            status_label = "FPGA ON" if self.serial.connected else "FPGA OFF"
-        status_txt = self.font(20).render(status_label, True, status_color)
-        self.screen.blit(
-            status_txt, status_txt.get_rect(topright=(SCREEN_W - _px(20), _py(54)))
+                text, col = (p, color) if isinstance(p, str) else p
+                surfs.append(self.font(size).render(text, True, col))
+        gap = _px(5)
+        rect = pygame.Rect(
+            0, 0,
+            sum(s.get_width() for s in surfs) + gap * (len(surfs) - 1),
+            max(s.get_height() for s in surfs),
         )
+        for k, v in pos.items():
+            setattr(rect, k, v)
+        x = rect.x
+        for s in surfs:
+            self.screen.blit(s, (x, rect.centery - s.get_height() // 2))
+            x += s.get_width() + gap
+        return rect
+
+    @property
+    def _start_key(self):
+        return "SPACE" if self._sim_mode else "START"
+
+    def _footer(self, action=None, hint=None):
+        """Rodape: a acao principal (tecla em laranja) e, abaixo, uma dica."""
+        cx = SCREEN_W // 2
+        if action:
+            self._inline(action, F_BODY + 2, T_MAIN, center=(cx, _py(552)))
+        if hint:
+            self._inline(hint, F_HINT, T_HINT, center=(cx, _py(578)))
+
+    def _title(self, text):
+        """Titulo de tela: sempre centralizado, na mesma altura e cor."""
+        self._text(text, F_TITLE, T_MAIN, center=(SCREEN_W // 2, _py(56)))
+
+    def _draw_menu_bg(self):
+        self.screen.fill(BG_COLOR)
+        self._draw_bg_grid()
+        self.screen.blit(self.scanline_surf, (0, 0))
+
+    def _draw_mode_tag(self):
+        """Canto inferior direito: so aparece em simulacao ou sem a FPGA."""
+        if self._sim_mode:
+            text, color = "SIM", T_HINT
+        elif not self.serial.connected:
+            text, color = "FPGA OFF", C_WARN
+        else:
+            return
+        self._text(text, F_HINT, color,
+                   bottomright=(SCREEN_W - _px(14), SCREEN_H - _py(22)))
+
+    def _draw_hud(self, score, misses, combo):
+        # Score (principal) e erros na margem esquerda
+        x = _px(18)
+        self._text("SCORE", F_HINT, T_HINT, topleft=(x, _py(14)))
+        self._text(f"{score:06d}", 60, T_MAIN, topleft=(x, _py(30)))
+        self._text("ERROS", F_HINT, T_HINT, topleft=(x, _py(78)))
+        pw, ph, pg = _px(8), _py(8), _px(3)
+        for k in range(MAX_MISSES):
+            pip = pygame.Rect(x + k * (pw + pg), _py(98), pw, ph)
+            if k < misses:
+                pygame.draw.rect(self.screen, C_BAD, pip, border_radius=2)
+            else:
+                pygame.draw.rect(self.screen, PANEL_LINE, pip, 2, border_radius=2)
+
+        # Combo na margem direita, espelhando o score
+        if combo >= 3:
+            wobble = 0
+            if combo >= 10 and not self.fpga_sensorial:  # sem tremor no perfil sensorial
+                wobble = int(2 * math.sin(pygame.time.get_ticks() * 0.012))
+            rx = SCREEN_W - _px(18)
+            self._text("COMBO", F_HINT, T_HINT, topright=(rx, _py(14)))
+            self._text(f"x{combo}", 60, T_MAIN, topright=(rx + wobble, _py(30)))
 
         # Barra de progresso baseada no frame_counter da FPGA (ou sim)
         if self.fpga_state == STATE_PLAY:
@@ -2671,10 +2630,10 @@ class Renderer:
             )
             ratio = min(1.0, self.fpga_frame_counter / max(1, _depth - 1))
             by = SCREEN_H - _py(14)
-            pygame.draw.rect(self.screen, (20, 40, 80), (_px(20), by, self._prog_bw, self._prog_bh), border_radius=4)
+            pygame.draw.rect(self.screen, PANEL_LINE, (_px(20), by, self._prog_bw, self._prog_bh), border_radius=3)
             fill_w = int(self._prog_bw * ratio)
             if fill_w > 0:
-                self.screen.blit(self._progress_grad, (_px(20), by), (0, 0, fill_w, self._prog_bh))
+                pygame.draw.rect(self.screen, T_SUB, (_px(20), by, fill_w, self._prog_bh), border_radius=3)
 
     # ── Telas ─────────────────────────────────────────────────────────────────
 
@@ -2685,35 +2644,23 @@ class Renderer:
         self._draw_idle_anim()
         self.screen.blit(self.scanline_surf, (0, 0))
 
-        # Titulo 3D Arcade com glow pulsante e flutuacao
+        # Logo com flutuacao
         ticks = pygame.time.get_ticks()
         float_y = 0 if self.fpga_sensorial else 6 * math.sin(ticks * 0.002)
-
-        logo_rect = self._logo.get_rect(center=(SCREEN_W // 2, _py(190) + int(float_y)))
+        cx = SCREEN_W // 2
+        logo_rect = self._logo.get_rect(center=(cx, _py(190) + int(float_y)))
         self.screen.blit(self._logo, logo_rect)
 
+        # Unica chamada da tela (pisca; fixa no perfil sensorial)
         if ticks % 1000 < 650 or self.fpga_sensorial:
-            sub = self.font(50).render("Aperte START para jogar", True, (255, 130, 0))
-            self.screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, _py(360))))
-
-        # Fixo (sem piscar): entrada das configuracoes de som
-        cfg = self.font(36).render(
-            "Aperte D / F / J / K para configurar som e jogo", True, (140, 170, 220)
-        )
-        self.screen.blit(cfg, cfg.get_rect(center=(SCREEN_W // 2, _py(400))))
-
-        if self._sim_mode:
-            hint_text = "[SIM]  SPACE = START   |   D / F / J / K = configuracoes"
-        else:
-            hint_text = ""
-        hint = self.font(30).render(hint_text, True, (60, 95, 155))
-        self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, _py(540))))
+            self._text(f"Aperte {self._start_key} para jogar", 50, ACCENT,
+                       center=(cx, _py(372)))
 
         if self._toast and time.monotonic() - self._toast[2] < TOAST_S:
             text, ok, _ = self._toast
-            color = (110, 220, 150) if ok else (240, 170, 90)
-            msg = self.font(30).render(text, True, color)
-            self.screen.blit(msg, msg.get_rect(center=(SCREEN_W // 2, _py(470))))
+            self._text(text, F_SMALL, C_OK if ok else C_WARN, center=(cx, _py(430)))
+
+        self._footer(hint=[*self._keys(), ("  configuracoes", T_SUB)])
 
     def _wrap_text(self, text, size, max_w):
         """Quebra texto em linhas que cabem em max_w pixels."""
@@ -2751,127 +2698,81 @@ class Renderer:
                 preview = None
             self._song_previews.append(preview)
 
-    def _draw_song_card(self, i, song, rect, now):
-        """Desenha um card de musica: botao da trilha, titulo, preview do chart e estatisticas."""
+    # Grade comum dos menus: 4 colunas, uma por botao (D, F, J, K)
+    _COL_W, _COL_GAP = _px(150), _px(18)
+
+    def _col_rect(self, i, top, h, n=4):
+        x0 = (SCREEN_W - (n * self._COL_W + (n - 1) * self._COL_GAP)) // 2
+        return pygame.Rect(x0 + i * (self._COL_W + self._COL_GAP), top, self._COL_W, h)
+
+    def _col_header(self, i, rect, active=True):
+        """Painel da coluna com o botao da trilha no topo (tecla so no --sim)."""
+        color = TRACK_COLORS[i]
+        line = tuple(int(c * 0.45) for c in color) if active else PANEL_LINE
+        self._panel(rect, line)
+        btn = self.btn_on[i] if active else self.btn_off[i]
+        by = rect.y + _py(46)
+        self.screen.blit(btn, btn.get_rect(center=(rect.centerx, by)))
+        if self._sim_mode:  # a tecla so interessa na simulacao por teclado
+            self._text(TRACK_LABELS[i], 40, BG_COLOR if active else T_HINT,
+                       center=(rect.centerx, by + 2))
+
+    def _draw_song_card(self, i, song, rect):
+        """Card de musica: botao da trilha, titulo, preview do chart e estatisticas."""
         color = TRACK_COLORS[i]
         avail = song["available"]
         cx = rect.centerx
-
-        # Painel (fundo escuro + tonalidade da cor da trilha)
-        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(panel, (*TRACK_BG, 235), panel.get_rect(), border_radius=_ps(10))
-        if avail:
-            pulse = 0.5 if self.fpga_sensorial else 0.5 + 0.5 * math.sin(now * 0.004 + i * 0.9)
-            pygame.draw.rect(panel, (*color, int(14 + 14 * pulse)), panel.get_rect(), border_radius=_ps(10))
-        self.screen.blit(panel, rect.topleft)
-
-        # Faixa colorida no topo + borda (brilho pulsante nos disponiveis)
-        border_col = color if avail else (50, 50, 80)
-        if avail:
-            glow = pygame.Surface((rect.w + 24, rect.h + 24), pygame.SRCALPHA)
-            pygame.draw.rect(glow, (*color, int(18 + 30 * pulse)), glow.get_rect(), 6, border_radius=_ps(14))
-            self.screen.blit(glow, (rect.x - 12, rect.y - 12))
-        pygame.draw.rect(self.screen, border_col, rect, 2, border_radius=_ps(10))
-        strip = pygame.Rect(rect.x + _ps(10), rect.y, rect.w - 2 * _ps(10), _ps(5))
-        pygame.draw.rect(self.screen, border_col, strip, border_radius=_ps(3))
-
-        # Botao arcade da trilha com a tecla
-        btn = self.btn_on[i] if avail else self.btn_off[i]
-        by = rect.y + _py(44)
-        self.screen.blit(btn, btn.get_rect(center=(cx, by)))
-        key_s = self.font(40).render(TRACK_LABELS[i], True, BG_COLOR if avail else (90, 90, 120))
-        self.screen.blit(key_s, key_s.get_rect(center=(cx, by + 2)))
-
-        sep_y = rect.y + _py(82)
-        pygame.draw.line(self.screen, border_col, (rect.x + _px(14), sep_y), (rect.right - _px(14), sep_y), 1)
-
+        self._col_header(i, rect, avail)
         if not avail:
-            em = self.font(22).render("EM BREVE", True, (60, 80, 130))
-            self.screen.blit(em, em.get_rect(center=rect.center))
+            self._text("EM BREVE", F_SMALL, T_HINT, center=rect.center)
             return
 
-        # Titulo e subtitulo
-        text_w = rect.w - _px(16)
-        y = sep_y + _py(18)
-        for line in self._wrap_text(song["title"], 24, text_w):
-            ls = self.font(24).render(line, True, (240, 245, 255))
-            self.screen.blit(ls, ls.get_rect(center=(cx, y)))
-            y += _py(18)
-        y += _py(4)
-        for line in self._wrap_text(song["subtitle"], 17, text_w):
-            ls = self.font(17).render(line, True, (130, 175, 225))
-            self.screen.blit(ls, ls.get_rect(center=(cx, y)))
-            y += _py(14)
+        # Titulo (principal), origem e autor
+        text_w = rect.w - _px(20)
+        y = rect.y + _py(104)
+        for line in self._wrap_text(song["title"], 30, text_w)[:2]:
+            self._text(line, 30, T_MAIN, center=(cx, y))
+            y += _py(22)
+        y = rect.y + _py(104) + 2 * _py(22) + _py(4)  # sempre 2 linhas de titulo
+        for line in self._wrap_text(song["subtitle"], F_HINT, text_w):
+            self._text(line, F_HINT, T_SUB, center=(cx, y))
+            y += _py(17)
         if song.get("author"):
-            au = self.font(15).render(song["author"], True, (90, 140, 200))
-            self.screen.blit(au, au.get_rect(center=(cx, y + _py(4))))
+            self._text(song["author"], F_HINT, T_HINT, center=(cx, y + _py(2)))
 
         # Mini-preview do chart (densidade de notas ao longo da musica)
-        bh = _py(90)
-        bw = rect.w - 2 * _px(14)
-        bx = rect.x + _px(14)
-        bottom = rect.bottom - _py(34)
-        pygame.draw.line(self.screen, LINE_COLOR, (bx, bottom), (bx + bw, bottom), 1)
+        bh = _py(56)
+        bw = rect.w - 2 * _px(16)
+        bx = rect.x + _px(16)
+        bottom = rect.bottom - _py(40)
+        dim = tuple(int(c * 0.4) for c in color)  # recessivo: o titulo manda
         preview = self._song_previews[i] if i < len(self._song_previews) else None
+        notes_txt = ""
         if preview and preview["notes"]:
             bins = preview["bins"]
             peak = max(bins)
             slot = bw / len(bins)
             for k, v in enumerate(bins):
-                h = max(2, int(bh * v / peak)) if v else 1
+                h = max(2, int(bh * v / peak)) if v else 2
                 bar = pygame.Rect(int(bx + k * slot) + 1, bottom - h, max(1, int(slot) - 2), h)
-                pygame.draw.rect(self.screen, color if v else LINE_COLOR, bar)
+                pygame.draw.rect(self.screen, dim if v else PANEL_LINE, bar)
             notes_txt = f"{preview['notes']} notas"
-        else:
-            notes_txt = ""
 
         # Estatisticas: duracao e numero de notas
         mins, secs = divmod(int(round(song["duration"])), 60)
-        stat_y = rect.bottom - _py(17)
-        dur = self.font(17).render(f"{mins}:{secs:02d}", True, (150, 190, 235))
-        self.screen.blit(dur, dur.get_rect(midleft=(bx, stat_y)))
+        stat_y = rect.bottom - _py(20)
+        self._text(f"{mins}:{secs:02d}", F_HINT, T_SUB, midleft=(bx, stat_y))
         if notes_txt:
-            nt = self.font(17).render(notes_txt, True, (150, 190, 235))
-            self.screen.blit(nt, nt.get_rect(midright=(bx + bw, stat_y)))
+            self._text(notes_txt, F_HINT, T_SUB, midright=(bx + bw, stat_y))
 
     def _draw_song_select(self):
-        """Tela de selecao de musica: 4 cards alinhados com as cores das trilhas."""
-        self.screen.fill(BG_COLOR)
-        self._draw_bg_grid()
-        self._draw_tracks(alpha=18)
-        self.screen.blit(self.scanline_surf, (0, 0))
-
-        now = pygame.time.get_ticks()
-        cx = SCREEN_W // 2
-
-        # Cabecalho: icone, titulo e sublinhado laranja
-        self.screen.blit(self._logo_select, self._logo_select.get_rect(center=(cx, _py(62))))
-        title = self.font(56).render("SELECIONAR MUSICA", True, (190, 225, 255))
-        shadow = self.font(56).render("SELECIONAR MUSICA", True, (10, 20, 55))
-        ty = _py(118)
-        self.screen.blit(shadow, shadow.get_rect(center=(cx + 3, ty + 3)))
-        self.screen.blit(title, title.get_rect(center=(cx, ty)))
-        pygame.draw.line(
-            self.screen, (255, 110, 0), (cx - _px(60), _py(140)), (cx + _px(60), _py(140)), 3
-        )
-
-        # Cards centralizados
-        box_w, box_h = _px(130), _py(300)
-        box_top = _py(165)
-        gap = _px(20)
-        x_start = (SCREEN_W - (4 * box_w + 3 * gap)) // 2
+        """Tela de selecao de musica: 4 cards, cada um no botao da sua cor."""
+        self._draw_menu_bg()
+        self._title("ESCOLHA A MUSICA")
         for i, song in enumerate(SONGS):
-            rect = pygame.Rect(x_start + i * (box_w + gap), box_top, box_w, box_h)
-            self._draw_song_card(i, song, rect, now)
-
-        # Dica
-        if self._sim_mode:
-            hint_text = "[SIM]  D = Hobbit  |  F = Ocarina  |  J = Power Rangers  |  K = Pokemon  |  SPACE = Voltar"
-        else:
-            hint_text = "Aperte o botao da cor da musica para comecar"
-        if now % 1400 < 1000 or self._sim_mode or self.fpga_sensorial:
-            hint = self.font(28).render(hint_text, True, (90, 135, 200))
-            self.screen.blit(hint, hint.get_rect(center=(cx, box_top + box_h + _py(30))))
+            self._draw_song_card(i, song, self._col_rect(i, _py(130), _py(330)))
+        self._footer([*self._keys(), "  aperte o botao da cor da musica"],
+                     [(self._start_key, T_SUB), "voltar"])
 
     def _draw_settings(self):
         """
@@ -2879,499 +2780,401 @@ class Renderer:
         confirmacao (mao sobre o sensor ~1 s). Estatica de proposito (sem piscar nem
         pulsar): o publico-alvo inclui jogadores sensiveis a estimulos.
         """
-        self.screen.fill(BG_COLOR)
-        self._draw_bg_grid()
-        self._draw_tracks(alpha=18)
-        self.screen.blit(self.scanline_surf, (0, 0))
+        self._draw_menu_bg()
         cx0 = SCREEN_W // 2
         page = self.fpga_pagina
+        self._title("CONFIGURACOES")
 
-        self.screen.blit(self._logo_select, self._logo_select.get_rect(center=(cx0, _py(36))))
-        title = self.font(46).render("CONFIGURACOES", True, (180, 220, 255))
-        self.screen.blit(title, title.get_rect(center=(cx0, _py(80))))
-
-        # Abas
-        TAB_W, TAB_H = _px(120), _py(30)
-        for k, name in enumerate(("Som", "Jogo")):
-            r = pygame.Rect(0, 0, TAB_W, TAB_H)
-            r.center = (cx0 + (k - 0.5) * (TAB_W + _px(12)), _py(116))
+        # Abas: a ativa em destaque, com sublinhado laranja
+        TAB_W = _px(110)
+        for k, name in enumerate(("SOM", "JOGO")):
             on = k == page
-            pygame.draw.rect(self.screen, (28, 48, 100) if on else (14, 22, 48), r, border_radius=6)
-            pygame.draw.rect(self.screen, (255, 130, 0) if on else LINE_COLOR, r,
-                             3 if on else 1, border_radius=6)
-            t = self.font(30).render(name, True, (235, 240, 255) if on else (100, 125, 175))
-            self.screen.blit(t, t.get_rect(center=r.center))
+            r = self._text(name, 40, T_MAIN if on else T_HINT,
+                           center=(cx0 + (k - 0.5) * TAB_W, _py(96)))
+            if on:
+                pygame.draw.rect(self.screen, T_MAIN,
+                                 (r.x, _py(110), r.w, max(3, _py(3))), border_radius=2)
 
-        BOX_W, BOX_H = _px(118), _py(250)
-        BOX_TOP = _py(142)
-        gap = _px(25)
-        x_start = (SCREEN_W - (4 * BOX_W + 3 * gap)) // 2
-        if page == 0:
-            self._draw_settings_som(x_start, BOX_W, BOX_H, BOX_TOP, gap)
-            legend = "Cada botao muda uma faixa:  " + " > ".join(
-                "0 dB" if k == 0 else f"-{EQ_STEP_DB * k}" for k in range(EQ_LEVELS)
-            ) + "  > 0 dB"
-        else:
-            self._draw_settings_jogo(x_start, BOX_W, BOX_H, BOX_TOP, gap)
-            legend = "D = metronomo   |   F = perfil sensorial   |   J = sem som"
-        info_y = BOX_TOP + BOX_H + _py(16)
-        info = self.font(28).render(legend, True, (160, 190, 235))
-        self.screen.blit(info, info.get_rect(center=(cx0, info_y)))
-
-        # Gesto de confirmacao: barra de progresso (0-7) e distancia atual
-        pw, ph = 4 * BOX_W + 3 * gap, _py(86)
-        panel = pygame.Rect(x_start, info_y + _py(16), pw, ph)
-        pygame.draw.rect(self.screen, (10, 18, 42), panel, border_radius=8)
-        pygame.draw.rect(self.screen, (40, 75, 140), panel, 2, border_radius=8)
-        msg = self.font(24).render(
-            "Segure a mao sobre o sensor para trocar de aba", True, (200, 215, 245))
-        self.screen.blit(msg, msg.get_rect(midleft=(panel.x + _px(14), panel.y + _py(18))))
-        SEGS = 8
-        seg_gap = _px(5)
-        bar_w = int(pw * 0.58)
-        seg_w = (bar_w - (SEGS - 1) * seg_gap) // SEGS
-        bx, by = panel.x + _px(14), panel.y + _py(40)
-        for k in range(SEGS):
-            r = pygame.Rect(bx + k * (seg_w + seg_gap), by, seg_w, _py(26))
-            if k < self.fpga_progresso:
-                pygame.draw.rect(self.screen, GESTO_COR, r, border_radius=3)
-            else:
-                pygame.draw.rect(self.screen, (50, 60, 90), r, 1, border_radius=3)
+        # Gesto de confirmacao numa linha: mao, instrucao, progresso (0-7), distancia
         d = self.fpga_dist
         na_faixa = FAIXA_MIN_CM <= d <= FAIXA_MAX_CM
-        # Indicador de distancia: regua 0-40 cm com a faixa valida marcada
-        rx0, rx1 = bx + bar_w + _px(30), panel.right - _px(14)
-        ry = by + _py(13)
-        pygame.draw.line(self.screen, (60, 80, 130), (rx0, ry), (rx1, ry), 2)
-        fx0 = rx0 + (rx1 - rx0) * FAIXA_MIN_CM // 40
-        fx1 = rx0 + (rx1 - rx0) * FAIXA_MAX_CM // 40
-        pygame.draw.rect(self.screen, (*GESTO_COR,), (fx0, ry - _py(6), fx1 - fx0, _py(12)), 2)
-        if d > 0:
-            mx = rx0 + (rx1 - rx0) * min(d, 40) // 40
-            pygame.draw.circle(self.screen, (110, 220, 150) if na_faixa else (240, 170, 90),
-                               (mx, ry), _ps(6))
-        dist_txt = f"{d} cm" if d else "sem leitura"
-        dcol = (110, 220, 150) if na_faixa else (140, 170, 220)
-        dt = self.font(28).render(f"Distancia: {dist_txt}", True, dcol)
-        self.screen.blit(dt, dt.get_rect(midleft=(rx0, panel.y + _py(18))))
-        rng = self.font(20).render(f"faixa valida {FAIXA_MIN_CM} a {FAIXA_MAX_CM} cm", True, (90, 115, 160))
-        self.screen.blit(rng, rng.get_rect(midleft=(rx0, ry + _py(22))))
+        SEGS, sw, sh, sg = 8, _px(10), _py(8), _px(3)
+        segs = pygame.Surface((SEGS * sw + (SEGS - 1) * sg, sh), pygame.SRCALPHA)
+        for k in range(SEGS):
+            r = pygame.Rect(k * (sw + sg), 0, sw, sh)
+            if k < self.fpga_progresso:
+                pygame.draw.rect(segs, T_MAIN, r, border_radius=2)
+            else:
+                pygame.draw.rect(segs, PANEL_LINE, r, 2, border_radius=2)
+        self._inline(
+            [self._hand_icons["on" if na_faixa else "off"],
+             "segure a mao no sensor para trocar de aba ", segs,
+             (f" {d} cm" if d else " -- cm", C_OK if na_faixa else T_HINT)],
+            F_HINT, T_SUB, center=(cx0, _py(138)),
+        )
 
-        back = self.font(30).render("START = salvar e voltar", True, (255, 130, 0))
-        self.screen.blit(back, back.get_rect(center=(cx0, panel.bottom + _py(18))))
-        if self._sim_mode:
-            hint = self.font(24).render(
-                "[SIM]  D / F / J / K = opcoes   |   G (segurar) = mao no sensor   |   SPACE = voltar",
-                True, (55, 90, 150))
-            self.screen.blit(hint, hint.get_rect(center=(cx0, panel.bottom + _py(40))))
+        top, h = _py(164), _py(330)
+        if page == 0:
+            self._draw_settings_som(top, h)
+        else:
+            self._draw_settings_jogo(top, h)
 
-    def _settings_box(self, i, x, w, h, top, color):
-        box = pygame.Rect(x - w // 2, top, w, h)
-        bg = pygame.Surface((w, h), pygame.SRCALPHA)
-        bg.fill((*color, 40))
-        self.screen.blit(bg, box.topleft)
-        pygame.draw.rect(self.screen, color, box, 2, border_radius=5)
-        key_s = self.font(40).render(TRACK_LABELS[i], True, color)
-        self.screen.blit(key_s, key_s.get_rect(center=(x, top + _py(24))))
-        pygame.draw.line(self.screen, color, (x - w // 2 + _px(10), top + _py(43)),
-                         (x + w // 2 - _px(10), top + _py(43)), 1)
+        self._footer(
+            [(self._start_key, ACCENT), "salvar e voltar"],
+            ["segure G para simular a mao no sensor"] if self._sim_mode else None,
+        )
 
-    def _draw_settings_som(self, x_start, BOX_W, BOX_H, BOX_TOP, gap):
-        SEG_W, SEG_H, SEG_GAP = _px(60), _py(20), _py(6)
+    def _draw_settings_som(self, top, h):
+        SEG_W, SEG_H, SEG_GAP = _px(70), _py(22), _py(8)
         for i, band in enumerate(EQ_BANDS):
-            cx = x_start + BOX_W // 2 + i * (BOX_W + gap)
+            rect = self._col_rect(i, top, h)
+            cx = rect.centerx
             color = TRACK_COLORS[i]
             level = self._eq[i]
-            self._settings_box(i, cx, BOX_W, BOX_H, BOX_TOP, color)
-            name_s = self.font(26).render(band["name"], True, (235, 240, 255))
-            self.screen.blit(name_s, name_s.get_rect(center=(cx, BOX_TOP + _py(60))))
-            range_s = self.font(16).render(band["range"], True, (130, 175, 225))
-            self.screen.blit(range_s, range_s.get_rect(center=(cx, BOX_TOP + _py(79))))
+            self._col_header(i, rect)
+            self._text(band["name"], 30, T_MAIN, center=(cx, top + _py(104)))
+            self._text(band["range"], F_HINT, T_HINT, center=(cx, top + _py(126)))
             # Medidor: segmentos acesos = quanto da faixa ainda soa
             lit = EQ_LEVELS - level
-            seg_bottom = BOX_TOP + _py(200)
+            seg_bottom = top + _py(270)
             for k in range(EQ_LEVELS):
                 y = seg_bottom - (k + 1) * SEG_H - k * SEG_GAP
                 seg = pygame.Rect(cx - SEG_W // 2, y, SEG_W, SEG_H)
                 if k < lit:
-                    pygame.draw.rect(self.screen, color, seg, border_radius=3)
+                    pygame.draw.rect(self.screen, color, seg, border_radius=4)
                 else:
-                    pygame.draw.rect(self.screen, (50, 60, 90), seg, 1, border_radius=3)
+                    pygame.draw.rect(self.screen, PANEL_LINE, seg, 2, border_radius=4)
             db_text = "0 dB" if level == 0 else f"-{EQ_STEP_DB * level} dB"
-            db_s = self.font(30).render(db_text, True, (235, 240, 255))
-            self.screen.blit(db_s, db_s.get_rect(center=(cx, BOX_TOP + _py(226))))
+            self._text(db_text, F_BODY, T_SUB, center=(cx, top + _py(298)))
 
-    def _draw_settings_jogo(self, x_start, BOX_W, BOX_H, BOX_TOP, gap):
-        met = ("Desligado", "Fixo")[1 if self.fpga_modo_met else 0]
+    def _draw_settings_jogo(self, top, h):
+        # Opcao "ligada" sempre em cima; o botao K nao tem funcao nesta aba
+        lig = ("Ligado", "Desligado")
         itens = [
-            ("Metronomo", ("Desligado", "Fixo"), met),
-            ("Perfil sensorial", ("Lig", "Desl"), "Lig" if self.fpga_sensorial else "Desl"),
-            ("Sem som", ("Lig", "Desl"), "Lig" if self.fpga_sem_som else "Desl"),
-            ("Reservado", (), ""),
+            ("Metronomo", ("Fixo", "Desligado"), "Fixo" if self.fpga_modo_met else "Desligado"),
+            ("Perfil sensorial", lig, lig[0 if self.fpga_sensorial else 1]),
+            ("Sem som", lig, lig[0 if self.fpga_sem_som else 1]),
         ]
         for i, (nome, opcoes, atual) in enumerate(itens):
-            cx = x_start + BOX_W // 2 + i * (BOX_W + gap)
-            color = TRACK_COLORS[i] if opcoes else (60, 75, 115)
-            self._settings_box(i, cx, BOX_W, BOX_H, BOX_TOP, color)
-            lines = self._wrap_text(nome, 24, BOX_W - _px(12))
-            for n, ln in enumerate(lines):
-                t = self.font(24).render(ln, True, (235, 240, 255) if opcoes else (90, 105, 145))
-                self.screen.blit(t, t.get_rect(center=(cx, BOX_TOP + _py(62) + n * _py(18))))
+            rect = self._col_rect(i, top, h, len(itens))
+            cx = rect.centerx
+            color = TRACK_COLORS[i]
+            self._col_header(i, rect, bool(opcoes))
+            for n, ln in enumerate(self._wrap_text(nome, 30, rect.w - _px(16))):
+                self._text(ln, 30, T_MAIN, center=(cx, top + _py(104) + n * _py(22)))
             for n, op in enumerate(opcoes):
-                r = pygame.Rect(0, 0, BOX_W - _px(24), _py(34))
-                r.center = (cx, BOX_TOP + _py(130) + n * _py(44))
+                r = pygame.Rect(0, 0, rect.w - _px(32), _py(38))
+                r.center = (cx, top + _py(190) + n * _py(50))
                 on = op == atual
                 if on:
-                    pygame.draw.rect(self.screen, color, r, border_radius=5)
+                    pygame.draw.rect(self.screen, color, r, border_radius=_ps(6))
                 else:
-                    pygame.draw.rect(self.screen, (50, 60, 90), r, 1, border_radius=5)
-                t = self.font(28).render(op, True, BG_COLOR if on else (120, 140, 185))
-                self.screen.blit(t, t.get_rect(center=r.center))
+                    pygame.draw.rect(self.screen, PANEL_LINE, r, 2, border_radius=_ps(6))
+                self._text(op, F_BODY, BG_COLOR if on else T_SUB,
+                           center=(r.centerx, r.centery + 2))
 
     def _draw_countdown(self, sec):
         self.screen.fill(BG_COLOR)
         self._draw_tracks()
         self._draw_hit_zone()
+        cx = SCREEN_W // 2
 
+        # Nome da musica acima da contagem
+        self._text(SONGS[self._selected_song]["title"], F_BODY, T_SUB,
+                   center=(cx, SCREEN_H // 2 - _py(130)))
         if sec > 0:
-            num = self.font(220).render(str(sec), True, (255, 120, 0))
-            self.screen.blit(
-                num, num.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - _py(40)))
-            )
-
-        # Nome da musica durante a contagem
-        sn = self.font(28).render(
-            SONGS[self._selected_song]["title"], True, (150, 200, 240)
-        )
-        self.screen.blit(
-            sn, sn.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + _py(70)))
-        )
+            self._text(str(sec), 220, ACCENT, center=(cx, SCREEN_H // 2 - _py(40)))
 
     def _draw_play(self, notes, score, misses, combo):
         self.screen.fill(BG_COLOR)
-        self._draw_bg_grid()       # 1. grid horizontal sutil
-        self._draw_tracks()        # 2. trilhas + bordas verticais (douradas no x2)
-        self._draw_notes(notes)    # 3. notas com glow
-        self._draw_hit_zone()      # 4. linha pulsante + botoes
-        self._advance_effects()    # 5. avanca estado dos efeitos
-        self._draw_hit_effects()   # 6. burst de acerto: aneis + particulas + flash
-        self._draw_hud(score, misses, combo)  # 7. painel HUD
-        self._draw_energia_hud()   # 7b. barra de energia, medidor da mao e selo x2
-        self._draw_met_hud()       # 7c. indicador do metronomo
-        self.screen.blit(self.scanline_surf, (0, 0))  # 8. scanlines CRT
+        self._draw_tracks()        # 1. trilhas com degrade + bordas verticais
+        self._draw_notes(notes)    # 2. notas com glow
+        # 3. linha pulsante + alvos; o alvo da trilha acende por alguns quadros
+        #    depois de um acerto (menos tempo no perfil sensorial)
+        lit_frames = 5 if self.fpga_sensorial else 9
+        self._draw_hit_zone({e["lane"] for e in self._hit_effects if e["age"] < lit_frames})
+        self._advance_effects()    # 4. avanca estado dos efeitos
+        self._draw_hit_effects()   # 5. burst de acerto: aneis + particulas + flash
+        self._draw_hud(score, misses, combo)  # 6. score, erros, combo, progresso
+        self._draw_energia_hud()   # 6b. barra de energia, mao e selo x2
+        self._draw_met_hud()       # 6c. indicador do metronomo
+        self.screen.blit(self.scanline_surf, (0, 0))  # 7. scanlines CRT
 
     def _draw_pause(self):
         self.screen.fill(BG_COLOR)
         self._draw_tracks(alpha=50)
+        self._draw_hud(self.fpga_score, self.fpga_misses, self.fpga_combo)
+        self.scratch.fill((0, 0, 0, 150))  # escurece o jogo atras da pausa
+        self.screen.blit(self.scratch, (0, 0))
         self.screen.blit(self.scanline_surf, (0, 0))
 
-        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 155))
-        self.screen.blit(overlay, (0, 0))
-
         cx = SCREEN_W // 2
-        ticks = pygame.time.get_ticks()
-        pulse = 0.5 if self.fpga_sensorial else 0.5 + 0.5 * math.sin(ticks * 0.003)
-
-        # Painel central
-        pw, ph = _px(310), _py(430)
-        px_ = (SCREEN_W - pw) // 2
-        py_ = (SCREEN_H - ph) // 2
-        panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
-        panel.fill((6, 12, 35, 210))
-        pygame.draw.rect(panel, (40, 85, 175, 200), (0, 0, pw, ph), 2, border_radius=14)
-        self.screen.blit(panel, (px_, py_))
-
-        # Logo
-        self.screen.blit(self._logo_pause, self._logo_pause.get_rect(center=(cx, py_ + _py(90))))
-
-        # Separador laranja
-        sep_y = py_ + _py(172)
-        pygame.draw.line(self.screen, (255, 110, 0, 200), (px_ + _px(25), sep_y), (px_ + pw - _px(25), sep_y), 2)
-
-        # "PAUSADO" com glow pulsante e sombra
-        glow_col = (int(120 + 60 * pulse), int(190 + 30 * pulse), 255)
-        shadow_s = self.font(85).render("PAUSADO", True, (10, 20, 55))
-        pause_s  = self.font(85).render("PAUSADO", True, glow_col)
-        txt_y = py_ + _py(255)
-        self.screen.blit(shadow_s, shadow_s.get_rect(center=(cx + 3, txt_y + 3)))
-        self.screen.blit(pause_s,  pause_s.get_rect(center=(cx, txt_y)))
-
-        # Separador sutil
-        sep2_y = py_ + _py(305)
-        pygame.draw.line(self.screen, (30, 55, 110), (px_ + _px(40), sep2_y), (px_ + pw - _px(40), sep2_y), 1)
-
-        # Hints
+        self._text("PAUSADO", 96, T_MAIN, center=(cx, _py(290)))
         if self._sim_mode:
-            line1, line2 = "SPACE: continuar", "ESC: menu inicial"
+            hint = [("ESC", T_SUB), "menu inicial"]
         else:
-            line1, line2 = "START: continuar", "Amarelo: menu inicial"
-        c = (120, 170, 220)
-        for i, line in enumerate([line1, line2]):
-            s = self.font(36).render(line, True, c)
-            self.screen.blit(s, s.get_rect(center=(cx, py_ + _py(340) + i * _py(48))))
-
-        self._draw_hud(self.fpga_score, self.fpga_misses, self.fpga_combo)
+            hint = [self._key_dot(0), " menu inicial"]
+        self._footer([(self._start_key, ACCENT), "continuar"], hint)
 
     # ── Dashboard de fim de sessao (DASHBOARD_SESSAO) ─────────────────────────
     # Estatico de proposito (sem piscar nem pulsar), como a tela de
-    # configuracoes. Valores em texto neutro; a cor da trilha so marca a
-    # identidade na barra, ao lado da tecla escrita.
-
-    _DASH_TEXT = (235, 240, 255)
-    _DASH_LABEL = (140, 170, 220)
-    _DASH_MUTED = (90, 115, 160)
-    _DASH_PANEL = (10, 18, 42)
-    _DASH_BORDER = (40, 75, 140)
-    _DASH_BETTER = (110, 220, 150)
-    _DASH_WORSE = (240, 170, 90)
-
-    def _dash_text(self, text, size, color, **pos):
-        surf = self.font(size).render(text, True, color)
-        self.screen.blit(surf, surf.get_rect(**pos))
-
-    def _dash_panel(self, rect):
-        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
-        panel.fill((*self._DASH_PANEL, 225))
-        self.screen.blit(panel, rect.topleft)
-        pygame.draw.rect(self.screen, self._DASH_BORDER, rect, 2, border_radius=8)
+    # configuracoes. A taxa de acerto e o numero principal; as demais metricas
+    # ficam em texto neutro, e a cor da trilha so marca a identidade na barra.
 
     def _dash_delta(self, key, unit):
         """Texto e cor da variacao em relacao a sessao anterior."""
         dash = self._dash
         if dash["prev"] is None or key not in dash["deltas"]:
-            return "", self._DASH_MUTED
+            return "", T_HINT
         d, better = dash["deltas"][key]
         if better is None:
-            return "igual a anterior", self._DASH_MUTED
+            return "igual a anterior", T_HINT
         word = "melhor" if better else "pior"
-        color = self._DASH_BETTER if better else self._DASH_WORSE
+        color = C_OK if better else C_WARN
         if key == "media_ms":
             # Melhor = mais perto de 0; a diferenca com sinal confunde aqui
             old = dash["summary"]["media_ms"] - d
             return f"antes {old:+.0f}{unit} ({word})", color
-        return f"{d:+.0f}{unit} vs anterior ({word})", color
+        return f"{d:+.0f}{unit} ({word})", color
 
     def _draw_dashboard(self):
         dash = self._dash
         if dash is None:  # primeiro quadro do fim, antes de _update_session
             return
         summ = dash["summary"]
+        self._draw_menu_bg()
 
-        self.screen.fill(BG_COLOR)
-        self._draw_bg_grid()
-        self._draw_tracks(alpha=18)
-        self.screen.blit(self.scanline_surf, (0, 0))
-
-        cx = SCREEN_W // 2
-        title = "VITORIA!" if dash["won"] else "FIM DE JOGO"
-        self._dash_text(title, 56, (0, 190, 255) if dash["won"] else (255, 90, 90),
-                        center=(cx, _py(32)))
-        sub = (f"{SONGS[dash['song']]['title']}   |   "
-               f"Score {dash['score']:06d}   |   Erros {dash['misses']}")
-        self._dash_text(sub, 26, self._DASH_LABEL, center=(cx, _py(62)))
-
-        # ── Linha de indicadores ─────────────────────────────────────────────
-        tiles = []
-        if summ["taxa"] is None:
-            tiles.append(("Taxa de acerto", "--", "nenhuma nota julgada", "taxa", " pp"))
-        else:
-            tiles.append(("Taxa de acerto", f"{summ['taxa']}%",
-                          f"{summ['acertos']} de {summ['notas']} notas", "taxa", " pp"))
-        if summ["media_ms"] is None:
-            tiles.append(("Assincronia media", "--", "sem acertos", "media_ms", " ms"))
-            tiles.append(("Desvio-padrao", "--", "sem acertos", "desvio_ms", " ms"))
-        else:
-            mean = summ["media_ms"]
-            sense = ("no tempo" if abs(mean) < 0.5 else
-                     "adiantado" if mean < 0 else "atrasado")
-            tiles.append(("Assincronia media", f"{mean:+.0f} ms", sense, "media_ms", " ms"))
-            tiles.append(("Desvio-padrao", f"{summ['desvio_ms']:.0f} ms",
-                          "variacao do tempo", "desvio_ms", " ms"))
-        tiles.append(("Maior combo", str(summ["maior_combo"]), "acertos seguidos",
-                      "maior_combo", ""))
-
-        TILE_W, TILE_H, GAP = _px(180), _py(110), _px(10)
-        full_w = 4 * TILE_W + 3 * GAP
+        GAP = _px(10)
+        full_w = _px(750)
         x0 = (SCREEN_W - full_w) // 2
-        top = _py(80)
-        for i, (label, value, note, key, unit) in enumerate(tiles):
-            r = pygame.Rect(x0 + i * (TILE_W + GAP), top, TILE_W, TILE_H)
-            self._dash_panel(r)
-            self._dash_text(label, 26, self._DASH_LABEL, center=(r.centerx, r.y + _py(15)))
-            self._dash_text(value, 64, self._DASH_TEXT, center=(r.centerx, r.y + _py(46)))
-            self._dash_text(note, 22, self._DASH_MUTED, center=(r.centerx, r.y + _py(74)))
-            delta, color = self._dash_delta(key, unit)
-            if delta:
-                self._dash_text(delta, 22, color, center=(r.centerx, r.y + _py(94)))
+        x1 = x0 + full_w
 
-        # ── Paineis do meio ──────────────────────────────────────────────────
-        PANEL_W = (full_w - GAP) // 2
-        ptop, ph = top + TILE_H + _py(10), _py(176)
-        self._draw_dash_tracks(pygame.Rect(x0, ptop, PANEL_W, ph), summ)
-        self._draw_dash_timing(
-            pygame.Rect(x0 + PANEL_W + GAP, ptop, PANEL_W, ph), summ
-        )
-
-        # ── Perfil (nome arcade) ─────────────────────────────────────────────
-        prof_top = ptop + ph + _py(10)
-        self._draw_dash_profile(pygame.Rect(x0, prof_top, full_w, _py(120)))
-
-        # ── Rodape ───────────────────────────────────────────────────────────
-        y = prof_top + _py(120) + _py(16)
-        gm = dash["metrics"]
-        etxt = f"Movimentos {gm['movimentos']}   |   x2 ativado {gm['ativacoes_x2']} vezes"
-        self._dash_text(
-            f"{etxt}   |   Metronomo: tempo por nivel: Semana 4",
-            22, self._DASH_LABEL, center=(cx, y),
-        )
-        start = "SPACE" if self._sim_mode else "START"
-        self._dash_text(f"Escolha o perfil e aperte {start} para salvar", 36,
-                        (255, 130, 0), center=(cx, y + _py(30)))
-
-    def _draw_dash_profile(self, rect):
-        """
-        Nome do perfil em estilo arcade: 3 caixas, a do cursor destacada com
-        borda laranja e seta. Estatico (sem piscar).
-        """
-        dash = self._dash
-        self._dash_panel(rect)
-        x, y = rect.x + _px(14), rect.y
-        self._dash_text("Perfil", 28, self._DASH_TEXT, midleft=(x, y + _py(18)))
-
-        BOX_W, BOX_H, BOX_GAP = _px(46), _py(62), _px(10)
-        box_top = y + _py(34)
-        hl = (255, 130, 0)
-        for k, ch in enumerate(self.fpga_nome):
-            r = pygame.Rect(x + k * (BOX_W + BOX_GAP), box_top, BOX_W, BOX_H)
-            active = k == self.fpga_cursor
-            pygame.draw.rect(self.screen, (24, 36, 72) if active else (14, 22, 48), r,
-                             border_radius=6)
-            pygame.draw.rect(self.screen, hl if active else self._DASH_BORDER, r,
-                             3 if active else 2, border_radius=6)
-            self._dash_text(ch, 72, self._DASH_TEXT, center=(r.centerx, r.centery + _py(3)))
-            if active:
-                tip = r.bottom + _py(5)
-                pygame.draw.polygon(self.screen, hl, [
-                    (r.centerx, tip), (r.centerx - _px(7), tip + _py(9)),
-                    (r.centerx + _px(7), tip + _py(9)),
-                ])
-
-        # Comandos
-        hx = x + 3 * (BOX_W + BOX_GAP) + _px(26)
-        for i, (keys, what) in enumerate((("D / F", "trocar a letra"),
-                                          ("J / K", "mudar de posicao"))):
-            ly = y + _py(52) + i * _py(30)
-            self._dash_text(keys, 30, self._DASH_TEXT, midleft=(hx, ly))
-            self._dash_text(what, 26, self._DASH_LABEL, midleft=(hx + _px(70), ly))
-
-        # Situacao do perfil e da comparacao
-        sx = rect.x + rect.w // 2 + _px(40)
+        # ── Cabecalho: resultado no centro, musica a esquerda, perfil a direita
+        self._title("VITORIA!" if dash["won"] else "FIM DE JOGO")
+        self._text(SONGS[dash["song"]]["title"], F_SMALL, T_SUB, midleft=(x0, _py(76)))
         prev, profile = dash["prev"], dash["profile"]
         if profile is None:
-            lines = [(f"Sem perfil ({NO_PROFILE})", self._DASH_TEXT),
-                     ("a sessao e salva sem nome", self._DASH_LABEL),
-                     ("e sem comparacao", self._DASH_LABEL)]
-        elif prev is not None:
-            when = prev.get("data_hora", "")
-            when = f"{when[8:10]}/{when[5:7]} {when[11:16]}" if len(when) >= 16 else when
-            lines = [(f"Perfil {profile}", self._DASH_TEXT),
-                     (f"comparado com a sessao de {when}", self._DASH_LABEL),
-                     (prev.get("musica", ""), self._DASH_MUTED)]
+            self._text("sem perfil", F_SMALL, T_HINT, midright=(x1, _py(76)))
         else:
-            lines = [(f"Perfil {profile}", self._DASH_TEXT),
-                     ("primeira sessao deste perfil", self._DASH_LABEL)]
-        for i, (text, color) in enumerate(lines):
-            self._dash_text(text, 30 if i == 0 else 24, color,
-                            midleft=(sx, y + _py(30) + i * _py(28)))
+            self._text(f"Perfil {profile}", F_BODY, T_SUB, midright=(x1, _py(52)))
+            if prev is not None:
+                when = prev.get("data_hora", "")
+                when = f"{when[8:10]}/{when[5:7]} {when[11:16]}" if len(when) >= 16 else when
+                self._text(f"comparado com a sessao de {when}", F_HINT, T_HINT,
+                           midright=(x1, _py(76)))
+            else:
+                self._text("primeira sessao deste perfil", F_HINT, T_HINT,
+                           midright=(x1, _py(76)))
+
+        # ── Os dois numeros principais: score e taxa de acerto ───────────────
+        top, HERO_H = _py(98), _py(170)
+        HERO_W = (full_w - GAP) // 2
+
+        score = pygame.Rect(x0, top, HERO_W, HERO_H)
+        self._panel(score)
+        hx, hr = score.x + _px(18), score.right - _px(18)
+        self._text("Score", F_SMALL, T_SUB, midleft=(hx, top + _py(22)))
+        self._text(f"{dash['score']:06d}", 124, T_MAIN, midleft=(hx, top + _py(80)))
+        erros = "erro" if dash["misses"] == 1 else "erros"
+        self._inline(
+            [(str(summ["maior_combo"]), T_MAIN), " maior combo        ",
+             (str(dash["misses"]), T_MAIN), f" {erros}"],
+            F_BODY, T_SUB, midleft=(hx, top + _py(140)),
+        )
+        delta, color = self._dash_delta("maior_combo", "")
+        if delta:
+            self._text(delta, F_HINT, color, midright=(hr, top + _py(140)))
+
+        taxa_r = pygame.Rect(score.right + GAP, top, x1 - score.right - GAP, HERO_H)
+        self._panel(taxa_r)
+        hx, hr = taxa_r.x + _px(18), taxa_r.right - _px(18)
+        self._text("Taxa de acerto", F_SMALL, T_SUB, midleft=(hx, top + _py(22)))
+        taxa = summ["taxa"]
+        vr = self._text("--" if taxa is None else f"{taxa}%", 124, T_MAIN,
+                        midleft=(hx, top + _py(80)))
+        # Contagem na mesma base do numero grande; variacao na linha do rotulo
+        base = vr.bottom - _py(14)
+        if taxa is None:
+            self._text("nenhuma nota julgada", F_SMALL, T_SUB, bottomright=(hr, base))
+        else:
+            self._text(f"{summ['acertos']} de {summ['notas']} notas", F_SMALL, T_SUB,
+                       bottomright=(hr, base))
+        delta, color = self._dash_delta("taxa", " pp")
+        if delta:
+            self._text(delta, F_HINT, color, midright=(hr, top + _py(22)))
+        # Barra segmentada (cada segmento = 5%)
+        SEGS, sg = 20, _px(3)
+        sw = (hr - hx - (SEGS - 1) * sg) // SEGS
+        lit = 0 if taxa is None else round(taxa * SEGS / 100)
+        for k in range(SEGS):
+            seg = pygame.Rect(hx + k * (sw + sg), top + _py(132), sw, _py(16))
+            if k < lit:
+                pygame.draw.rect(self.screen, C_DATA, seg, border_radius=3)
+            else:
+                pygame.draw.rect(self.screen, PANEL_LINE, seg, 2, border_radius=3)
+
+        # ── Detalhes: acertos por trilha e assincronia ───────────────────────
+        ptop, ph = top + HERO_H + GAP, _py(222)
+        self._draw_dash_tracks(pygame.Rect(x0, ptop, HERO_W, ph), summ)
+        self._draw_dash_timing(
+            pygame.Rect(score.right + GAP, ptop, x1 - score.right - GAP, ph), summ
+        )
+
+        # ── Rodape ───────────────────────────────────────────────────────────
+        gm = dash["metrics"]
+        self._footer(
+            [(self._start_key, ACCENT), "continuar"],
+            [(f"movimentos da mao {gm['movimentos']}      "
+              f"x2 ativado {gm['ativacoes_x2']} vezes", T_SUB)],
+        )
 
     def _draw_dash_tracks(self, rect, summ):
         """Acertos por trilha: medidor por trilha + resumo por mao."""
-        self._dash_panel(rect)
-        x, y = rect.x + _px(14), rect.y
-        self._dash_text("Acertos por trilha", 28, self._DASH_TEXT,
-                        midleft=(x, y + _py(18)))
-        BAR_X, BAR_W, BAR_H = x + _px(28), _px(190), _py(14)
+        self._panel(rect)
+        x, y = rect.x + _px(18), rect.y
+        self._text("Acertos por trilha", F_SMALL, T_SUB, midleft=(x, y + _py(22)))
+        BAR_X, BAR_W, BAR_H = x + _px(30), _px(190), _py(14)
         for t, (hits, notes) in enumerate(summ["trilhas"]):
-            ry = y + _py(44) + t * _py(26)
-            self._dash_text(TRACK_LABELS[t], 30, self._DASH_TEXT, midleft=(x, ry))
+            ry = y + _py(62) + t * _py(34)
+            dot = self._key_dot(t, _ps(9))
+            self.screen.blit(dot, dot.get_rect(midleft=(x, ry)))
             color = TRACK_COLORS[t]
-            track_col = tuple(int(c * 0.28) for c in color)
             bar = pygame.Rect(BAR_X, ry - BAR_H // 2, BAR_W, BAR_H)
-            pygame.draw.rect(self.screen, track_col, bar, border_radius=4)
-            if notes:
-                fill = int(BAR_W * hits / notes)
-                if fill > 0:
-                    pygame.draw.rect(self.screen, color, (bar.x, bar.y, fill, BAR_H),
-                                     border_radius=4)
-                txt = f"{hits}/{notes}   {100 * hits // notes}%"
-            else:
-                txt = "sem notas"
-            self._dash_text(txt, 24, self._DASH_LABEL,
-                            midleft=(BAR_X + BAR_W + _px(10), ry))
-        hy = y + _py(44) + 4 * _py(26) + _py(6)
-        pygame.draw.line(self.screen, self._DASH_BORDER, (x, hy - _py(10)),
-                         (rect.right - _px(14), hy - _py(10)), 1)
+            pygame.draw.rect(self.screen, tuple(int(c * 0.2) for c in color), bar,
+                             border_radius=4)
+            if not notes:
+                self._text("sem notas", F_HINT, T_HINT, midleft=(bar.right + _px(10), ry))
+                continue
+            fill = int(BAR_W * hits / notes)
+            if fill > 0:
+                pygame.draw.rect(self.screen, color, (bar.x, bar.y, fill, BAR_H),
+                                 border_radius=4)
+            self._inline([(f"{100 * hits // notes}%", T_MAIN), (f" {hits}/{notes}", T_HINT)],
+                         F_SMALL, midleft=(bar.right + _px(10), ry))
         parts = []
         for i, (name, hits, notes) in enumerate(summ["maos"]):
-            keys = "+".join(TRACK_LABELS[t] for t in HANDS[i][1])
             val = f"{100 * hits // notes}%" if notes else "--"
-            parts.append(f"{name} ({keys}): {val}")
-        self._dash_text("   |   ".join(parts), 24, self._DASH_LABEL, midleft=(x, hy))
+            parts.append(f"{name} {val}")
+        self._text("      ".join(parts), F_HINT, T_SUB, midleft=(x, y + _py(198)))
 
     def _draw_dash_timing(self, rect, summ):
-        """Assincronia: eixo da janela de acerto com a media e a faixa +-desvio."""
-        self._dash_panel(rect)
-        x = rect.x + _px(14)
-        self._dash_text("Assincronia dos acertos (ms)", 28, self._DASH_TEXT,
-                        midleft=(x, rect.y + _py(18)))
+        """Assincronia: media e desvio em texto + eixo da janela de acerto."""
+        self._panel(rect)
+        x, xr = rect.x + _px(18), rect.right - _px(18)
+        self._text("Assincronia dos acertos", F_SMALL, T_SUB, midleft=(x, rect.y + _py(22)))
 
         lim_ms = SimulationEngine.HIT_WIN * FRAME_MS  # borda da janela (~183 ms)
         ax0, ax1 = rect.x + _px(28), rect.right - _px(28)
-        ay = rect.y + _py(84)
+        ay = rect.y + _py(144)
+        bh = _py(24)  # altura da faixa media +- desvio
         mean, std = summ["media_ms"], summ["desvio_ms"]
 
         def to_x(ms):
             ms = max(-lim_ms, min(lim_ms, ms))
             return int(ax0 + (ms + lim_ms) / (2 * lim_ms) * (ax1 - ax0))
 
+        # Media e desvio-padrao: apoio, menores que score e taxa
+        if mean is not None:
+            sense = ("no tempo" if abs(mean) < 0.5 else
+                     "adiantado" if mean < 0 else "atrasado")
+            self._inline([(f"{mean:+.0f} ms", T_MAIN), f" media, {sense}"],
+                         F_SMALL, T_SUB, midleft=(x, rect.y + _py(58)))
+            self._inline([(f"{std:.0f} ms", T_MAIN), " desvio-padrao"],
+                         F_SMALL, T_SUB, midright=(xr, rect.y + _py(58)))
+            delta, color = self._dash_delta("media_ms", " ms")
+            if delta:
+                self._text(delta, F_HINT, color, midleft=(x, rect.y + _py(80)))
+            delta, color = self._dash_delta("desvio_ms", " ms")
+            if delta:
+                self._text(delta, F_HINT, color, midright=(xr, rect.y + _py(80)))
+
         # Faixa media +- desvio, acima do eixo (nao cobre os rotulos)
         if mean is not None:
-            band = pygame.Rect(to_x(mean - std), ay - _py(16), 0, _py(16))
+            band = pygame.Rect(to_x(mean - std), ay - bh, 0, bh)
             band.width = max(2, to_x(mean + std) - band.x)
             surf = pygame.Surface(band.size, pygame.SRCALPHA)
-            surf.fill((0, 180, 255, 70))
+            surf.fill((*C_DATA, 70))
             self.screen.blit(surf, band.topleft)
 
         # Eixo e marcas (recessivos)
-        pygame.draw.line(self.screen, self._DASH_BORDER, (ax0, ay), (ax1, ay), 2)
+        pygame.draw.line(self.screen, PANEL_LINE, (ax0, ay), (ax1, ay), 2)
         for ms in (-150, -100, -50, 0, 50, 100, 150):
             tx = to_x(ms)
             h = _py(8) if ms == 0 else _py(4)
-            pygame.draw.line(self.screen, (90, 120, 180) if ms == 0 else self._DASH_BORDER,
-                             (tx, ay - h), (tx, ay + h), 2 if ms == 0 else 1)
-            self._dash_text(f"{ms:+d}" if ms else "0", 18, self._DASH_MUTED,
-                            center=(tx, ay + _py(16)))
-        self._dash_text("adiantado", 22, self._DASH_MUTED, midleft=(ax0, ay + _py(34)))
-        self._dash_text("atrasado", 22, self._DASH_MUTED, midright=(ax1, ay + _py(34)))
+            pygame.draw.line(self.screen, T_HINT if ms == 0 else PANEL_LINE,
+                             (tx, ay - h), (tx, ay + h), 2)
+            self._text(f"{ms:+d}" if ms else "0", F_HINT, T_HINT, center=(tx, ay + _py(18)))
+        self._text("adiantado", F_HINT, T_SUB, midleft=(ax0, ay + _py(44)))
+        self._text("atrasado", F_HINT, T_SUB, midright=(ax1, ay + _py(44)))
 
         if mean is None:
-            self._dash_text("sem acertos nesta musica", 24, self._DASH_LABEL,
-                            center=(rect.centerx, ay - _py(30)))
+            self._text("sem acertos nesta musica", F_SMALL, T_SUB,
+                       center=(rect.centerx, ay - _py(40)))
             return
         # Marcador da media
         mx = to_x(mean)
-        pygame.draw.line(self.screen, (0, 180, 255), (mx, ay - _py(20)), (mx, ay + _py(4)), 3)
-        pygame.draw.circle(self.screen, BG_COLOR, (mx, ay - _py(24)), _ps(7))
-        pygame.draw.circle(self.screen, (0, 180, 255), (mx, ay - _py(24)), _ps(5))
+        pygame.draw.line(self.screen, C_DATA, (mx, ay - bh - _py(4)), (mx, ay + _py(4)), 3)
+        pygame.draw.circle(self.screen, BG_COLOR, (mx, ay - bh - _py(8)), _ps(7))
+        pygame.draw.circle(self.screen, C_DATA, (mx, ay - bh - _py(8)), _ps(5))
 
-        self._dash_text(f"media {mean:+.0f} ms   (faixa = media +- desvio)", 22,
-                        self._DASH_LABEL, midleft=(x, rect.y + _py(140)))
-        self._dash_text(
-            f"erro medio {summ['abs_media_ms']:.0f} ms   |   janela +-{lim_ms:.0f} ms"
-            f"   |   1 quadro = {FRAME_MS:.1f} ms",
-            20, self._DASH_MUTED, midleft=(x, rect.y + _py(160)),
+    # ── Tela do nome do perfil (estado NOME, depois do fim de sessao) ─────────
+
+    def _draw_name(self):
+        """
+        Nome do perfil em estilo arcade: 3 caixas grandes, a do cursor com
+        borda laranja e seta. Estatica (sem piscar). START grava a sessao.
+        """
+        dash = self._dash
+        if dash is None:  # primeiro quadro, antes de _update_session
+            return
+        self._draw_menu_bg()
+        cx = SCREEN_W // 2
+        self._title("QUEM JOGOU?")
+        self._text("escolha o perfil para salvar a sessao", F_SMALL, T_SUB,
+                   center=(cx, _py(94)))
+
+        BOX_W, BOX_H, BOX_GAP = _px(96), _py(140), _px(18)
+        bx0 = cx - (3 * BOX_W + 2 * BOX_GAP) // 2
+        box_top = _py(150)
+        for k, ch in enumerate(self.fpga_nome):
+            r = pygame.Rect(bx0 + k * (BOX_W + BOX_GAP), box_top, BOX_W, BOX_H)
+            active = k == self.fpga_cursor
+            pygame.draw.rect(self.screen, PANEL_BG, r, border_radius=_ps(10))
+            pygame.draw.rect(self.screen, ACCENT if active else PANEL_LINE, r,
+                             4 if active else 2, border_radius=_ps(10))
+            self._text(ch, 180, T_MAIN, center=(r.centerx, r.centery + _py(8)))
+            if active:
+                tip = r.bottom + _py(8)
+                pygame.draw.polygon(self.screen, ACCENT, [
+                    (r.centerx, tip), (r.centerx - _px(9), tip + _py(12)),
+                    (r.centerx + _px(9), tip + _py(12)),
+                ])
+
+        # Comandos: quais botoes fazem o que
+        r = _ps(11)
+        self._inline(
+            [*self._keys((0, 1), r), " trocar a letra          ",
+             *self._keys((2, 3), r), " mudar de posicao"],
+            F_BODY, T_SUB, center=(cx, _py(356)),
         )
+
+        # Situacao do perfil e da comparacao com a sessao anterior
+        prev, profile = dash["prev"], dash["profile"]
+        if profile is None:
+            lines = [("sem perfil: a sessao e salva sem nome e sem comparacao", T_SUB)]
+        elif prev is not None:
+            when = prev.get("data_hora", "")
+            when = f"{when[8:10]}/{when[5:7]} {when[11:16]}" if len(when) >= 16 else when
+            lines = [(f"ultima sessao em {when}   {prev.get('musica', '')}", T_SUB)]
+            delta, color = self._dash_delta("taxa", " pp")
+            if delta:
+                lines.append((f"taxa de acerto {delta}", color))
+        else:
+            lines = [("primeira sessao deste perfil", T_SUB)]
+        for i, (text, color) in enumerate(lines):
+            self._text(text, F_SMALL, color, center=(cx, _py(420) + i * _py(26)))
+
+        self._footer([(self._start_key, ACCENT), "salvar a sessao"])
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
@@ -3410,7 +3213,10 @@ class Renderer:
                 self._draw_pause()
             elif s in (STATE_WIN, STATE_LOSE):
                 self._draw_dashboard()
+            elif s == STATE_NAME:
+                self._draw_name()
 
+            self._draw_mode_tag()
             self.screen.blit(self.vignette_surf, (0, 0))
             self._present()
             self.clock.tick(FPS)

@@ -14,6 +14,7 @@
  *   0101 = end_lose  Derrota (10 erros)
  *   0110 = select    Selecao de musica
  *   0111 = settings  Configuracoes de som (atenuador de frequencias)
+ *   1000 = nome      Nome do perfil (tela seguinte ao fim de musica)
  *
  * Transicoes:
  *   idle    --(START)--> select
@@ -26,7 +27,8 @@
  *   play    --(fim_tempo)--> end_win
  *   play    --(START)--> pause
  *   pause   --(START)--> play
- *   end_win/end_lose --(START)--> idle
+ *   end_win/end_lose --(START)--> nome
+ *   nome    --(START)--> idle
  *-----------------------------------------------------------------------
  */
 
@@ -56,6 +58,7 @@ module unidade_controle (
     localparam end_lose  = 4'b0101;
     localparam select    = 4'b0110;
     localparam settings  = 4'b0111;
+    localparam nome      = 4'b1000;
 
     reg [3:0] Eatual, Eprox;
 
@@ -78,16 +81,19 @@ module unidade_controle (
                                start     ? pause    : play;
             pause:     Eprox = song_ok ? idle :
                                start   ? play  : pause;
-            end_win:   Eprox = start ? idle : end_win;
-            end_lose:  Eprox = start ? idle : end_lose;
+            end_win:   Eprox = start ? nome : end_win;
+            end_lose:  Eprox = start ? nome : end_lose;
+            // Em nome os botoes de trilha so editam o perfil (FD); START salva e sai
+            nome:      Eprox = start ? idle : nome;
             default:   Eprox = idle;
         endcase
     end
 
     always @* begin
-        // Timers zerados em idle, select, settings, end_win e end_lose
+        // Timers zerados em idle, select, settings, end_win, end_lose e nome
         zera_timer  = (Eatual == idle || Eatual == select || Eatual == settings ||
-                       Eatual == end_win || Eatual == end_lose) ? 1'b1 : 1'b0;
+                       Eatual == end_win || Eatual == end_lose ||
+                       Eatual == nome) ? 1'b1 : 1'b0;
         conta_timer = (Eatual == countdown || Eatual == play) ? 1'b1 : 1'b0;
         game_active = (Eatual == play) ? 1'b1 : 1'b0;
         // Registros limpos em idle, select e settings (antes de comecar a musica)

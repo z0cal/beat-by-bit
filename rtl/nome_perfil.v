@@ -9,7 +9,7 @@
  *   Caracteres (6 bits): 0 = '-', 1..26 = 'A'..'Z', 27..36 = '0'..'9'.
  *   Nome "---" = sem perfil.
  *
- *   Com habilita=1 (estados END_WIN/END_LOSE):
+ *   Com habilita=1 (estado NOME, a tela seguinte ao fim de musica):
  *     pulso[0] (D) = caractere anterior na posicao do cursor
  *     pulso[1] (F) = proximo caractere  (37 valores, volta ao inicio)
  *     pulso[2] (J) = cursor a esquerda  (para na posicao 0)
@@ -25,7 +25,7 @@
 module nome_perfil (
     input  wire        clock,
     input  wire        reset,
-    input  wire        habilita,   // ativo so no fim de musica
+    input  wire        habilita,   // ativo so na tela do nome
     input  wire [3:0]  pulso,      // btn_pulse das trilhas
     output reg  [17:0] nome,
     output reg  [1:0]  cursor

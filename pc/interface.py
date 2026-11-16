@@ -84,6 +84,8 @@ from sys import exit
 
 import numpy as np
 
+from robo import RobotEvents, RobotLink  # tela do robo (ESP32)
+
 try:
     import serial
 
@@ -1508,8 +1510,12 @@ class Renderer:
         scale=None,
         audio_offset_ms=0,
         history_path=DEFAULT_HISTORY,
+        robo_port=None,
     ):
         self._sim_mode = sim_mode
+        # Robo (ESP32 + ST7789V): feliz no acerto, triste no erro, festa no fim
+        self._robo = RobotLink(robo_port) if robo_port else None
+        self._robo_ev = RobotEvents()
         # Sessao: so o nome de 3 caracteres identifica a crianca (PRIVACIDADE)
         self._log = SessionLog(history_path)
         self._session_live = False  # viu PLAY desde o ultimo fim de musica
@@ -1985,6 +1991,9 @@ class Renderer:
             est = t_pkt - (pkt["frame_counter"] - 1) / FPS
             if self._play_anchor is None or est < self._play_anchor:
                 self._play_anchor = est
+        if self._robo is not None:
+            for cmd in self._robo_ev.update(pkt):
+                self._robo.send(cmd)
         prev_state = self.fpga_state
         prev_mov = self.fpga_movimentos
         self._prev_notes = [list(t) for t in self.fpga_notes]
@@ -3179,6 +3188,9 @@ class Renderer:
             events = pygame.event.get()
             for event in events:
                 if event.type == pygame.QUIT:
+                    if self._robo:
+                        self._robo.send("N")
+                        self._robo.close()
                     if self.serial:
                         self.serial.stop()
                     pygame.quit()
@@ -3272,6 +3284,11 @@ if __name__ == "__main__":
         metavar="CSV",
         help="Arquivo CSV do historico de sessoes (padrao: sessoes/sessoes.csv)",
     )
+    parser.add_argument(
+        "--robo-port",
+        default=None,
+        help="Porta serial da ESP32 do robo (ex.: COM7 ou /dev/ttyUSB1); sem ela, sem robo",
+    )
     args = parser.parse_args()
 
     Renderer(
@@ -3281,4 +3298,5 @@ if __name__ == "__main__":
         scale=args.scale,
         audio_offset_ms=args.audio_offset,
         history_path=args.historico,
+        robo_port=args.robo_port,
     ).run()

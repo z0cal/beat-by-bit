@@ -9,6 +9,8 @@ qdb/
 cdb/
 .nvim/
 
+robo/.pio/
+
 *.rpt
 *.summary
 *.qws

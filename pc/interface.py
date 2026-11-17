@@ -668,19 +668,25 @@ class SessionLog:
     def __init__(self, path=DEFAULT_HISTORY):
         self.path = path
 
-    def previous(self, pseudonym):
-        """Ultima sessao gravada do mesmo pseudonimo, ou None."""
-        if not pseudonym or not os.path.exists(self.path):
-            return None
-        last = None
+    def rows(self):
+        """Todas as linhas do historico, em ordem de gravacao ([] se nao houver)."""
+        if not os.path.exists(self.path):
+            return []
         try:
             with open(self.path, newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row.get("pseudonimo") == pseudonym:
-                        last = row
+                return list(csv.DictReader(f))
         except (OSError, csv.Error) as e:
             print(f"[historico] nao foi possivel ler {self.path}: {e}")
+            return []
+
+    def previous(self, pseudonym):
+        """Ultima sessao gravada do mesmo pseudonimo, ou None."""
+        if not pseudonym:
             return None
+        last = None
+        for row in self.rows():
+            if row.get("pseudonimo") == pseudonym:
+                last = row
         return last
 
     def _migrate(self):
@@ -733,6 +739,64 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ─── Perfis salvos: sugestoes e evolucao (tela NOME, so no PC) ───────────────
+
+def profile_index(rows):
+    """{pseudonimo: {"n": sessoes, "last": data_hora da ultima}}; sem nome fica fora."""
+    out = {}
+    for row in rows:
+        name = row.get("pseudonimo") or ""
+        if not name:
+            continue
+        e = out.setdefault(name, {"n": 0, "last": ""})
+        e["n"] += 1
+        e["last"] = max(e["last"], row.get("data_hora") or "")
+    return out
+
+
+def match_profiles(index, name, limit=5):
+    """
+    Perfis salvos que combinam com o nome na tela, os melhores primeiro.
+    Cada caractere diferente de '-' e uma posicao fixa; '-' vale qualquer um
+    ("V--" casa "V96" e "VB-"). Ordem: igual ao nome, depois o mais recente.
+    "---" lista os mais recentes.
+    """
+    fixed = [(k, c) for k, c in enumerate(name) if c != "-"]
+    found = [
+        (prof != name, info["last"], prof)
+        for prof, info in index.items()
+        if len(prof) == len(name) and all(prof[k] == c for k, c in fixed)
+    ]
+    found.sort(key=lambda t: t[1], reverse=True)  # mais recente primeiro
+    found.sort(key=lambda t: t[0])  # estavel: o exato sobe sem mudar o resto
+    return [t[2] for t in found[:limit]]
+
+
+def profile_history(rows, name, limit=10):
+    """Ultimas sessoes do perfil (antiga -> recente), so as que tem taxa de acerto."""
+    out = []
+    for row in rows:
+        if not name or row.get("pseudonimo") != name:
+            continue
+        taxa = _num(row.get("taxa_pct"))
+        if taxa is None or not _num(row.get("notas")):
+            continue
+        out.append({
+            "data_hora": row.get("data_hora", ""),
+            "musica": row.get("musica", ""),
+            "taxa": taxa,
+            "desvio_ms": _num(row.get("assinc_desvio_ms")),
+            "maior_combo": _num(row.get("maior_combo")),
+            "row": row,
+        })
+    return out[-limit:] if limit else out
+
+
+def short_date(when):
+    """'2026-11-03T09:48:56' -> '03/11'."""
+    return f"{when[8:10]}/{when[5:7]}" if len(when) >= 10 else when
 
 
 def session_deltas(summ, prev):
@@ -2136,6 +2200,9 @@ class Renderer:
             "sensorial": self.fpga_sensorial,
             "name": None,
         }
+        # Historico lido uma vez; a troca de nome so filtra em memoria
+        dash["rows"] = self._log.rows()
+        dash["index"] = profile_index(dash["rows"])
         self._session_live = False
         return dash
 
@@ -2146,7 +2213,15 @@ class Renderer:
             return
         dash["name"] = self.fpga_nome
         dash["profile"] = profile_of(self.fpga_nome)
-        dash["prev"] = self._log.previous(dash["profile"])
+        dash["suggest"] = match_profiles(dash["index"], self.fpga_nome)
+        dash["history"] = profile_history(dash["rows"], dash["profile"])
+        # ultima sessao gravada do perfil (mesmo criterio de antes: qualquer linha)
+        prev = None
+        if dash["profile"]:
+            for row in dash["rows"]:
+                if row.get("pseudonimo") == dash["profile"]:
+                    prev = row
+        dash["prev"] = prev
         dash["deltas"] = session_deltas(dash["summary"], dash["prev"])
 
     def _finish_session(self):
@@ -3117,60 +3192,186 @@ class Renderer:
 
     def _draw_name(self):
         """
-        Nome do perfil em estilo arcade: 3 caixas grandes, a do cursor com
-        borda laranja e seta. Estatica (sem piscar). START grava a sessao.
+        Nome do perfil em estilo arcade: 3 caixas, a do cursor com borda
+        laranja e seta. A esquerda, os perfis salvos que combinam com o nome;
+        a direita, a evolucao do perfil. Estatica (sem piscar). START grava.
         """
         dash = self._dash
         if dash is None:  # primeiro quadro, antes de _update_session
             return
         self._draw_menu_bg()
-        cx = SCREEN_W // 2
         self._title("QUEM JOGOU?")
         self._text("escolha o perfil para salvar a sessao", F_SMALL, T_SUB,
-                   center=(cx, _py(94)))
+                   center=(SCREEN_W // 2, _py(94)))
 
-        BOX_W, BOX_H, BOX_GAP = _px(96), _py(140), _px(18)
+        # ── Coluna esquerda: caixas do nome + comandos + sugestoes
+        lx0, lx1 = _px(25), _px(380)
+        cx = (lx0 + lx1) // 2
+        BOX_W, BOX_H, BOX_GAP = _px(70), _py(105), _px(14)
         bx0 = cx - (3 * BOX_W + 2 * BOX_GAP) // 2
-        box_top = _py(150)
+        box_top = _py(122)
         for k, ch in enumerate(self.fpga_nome):
             r = pygame.Rect(bx0 + k * (BOX_W + BOX_GAP), box_top, BOX_W, BOX_H)
             active = k == self.fpga_cursor
             pygame.draw.rect(self.screen, PANEL_BG, r, border_radius=_ps(10))
             pygame.draw.rect(self.screen, ACCENT if active else PANEL_LINE, r,
                              4 if active else 2, border_radius=_ps(10))
-            self._text(ch, 180, T_MAIN, center=(r.centerx, r.centery + _py(8)))
+            self._text(ch, 130, T_MAIN, center=(r.centerx, r.centery + _py(6)))
             if active:
-                tip = r.bottom + _py(8)
+                tip = r.bottom + _py(7)
                 pygame.draw.polygon(self.screen, ACCENT, [
-                    (r.centerx, tip), (r.centerx - _px(9), tip + _py(12)),
-                    (r.centerx + _px(9), tip + _py(12)),
+                    (r.centerx, tip), (r.centerx - _px(8), tip + _py(10)),
+                    (r.centerx + _px(8), tip + _py(10)),
                 ])
 
-        # Comandos: quais botoes fazem o que
-        r = _ps(11)
-        self._inline(
-            [*self._keys((0, 1), r), " trocar a letra          ",
-             *self._keys((2, 3), r), " mudar de posicao"],
-            F_BODY, T_SUB, center=(cx, _py(356)),
-        )
+        rk = _ps(10)
+        self._inline([*self._keys((0, 1), rk), " trocar a letra"], F_SMALL, T_SUB,
+                     center=(cx, _py(268)))
+        self._inline([*self._keys((2, 3), rk), " mudar de posicao"], F_SMALL, T_SUB,
+                     center=(cx, _py(294)))
 
-        # Situacao do perfil e da comparacao com a sessao anterior
-        prev, profile = dash["prev"], dash["profile"]
-        if profile is None:
-            lines = [("sem perfil: a sessao e salva sem nome e sem comparacao", T_SUB)]
-        elif prev is not None:
-            when = prev.get("data_hora", "")
-            when = f"{when[8:10]}/{when[5:7]} {when[11:16]}" if len(when) >= 16 else when
-            lines = [(f"ultima sessao em {when}   {prev.get('musica', '')}", T_SUB)]
-            delta, color = self._dash_delta("taxa", " pp")
-            if delta:
-                lines.append((f"taxa de acerto {delta}", color))
-        else:
-            lines = [("primeira sessao deste perfil", T_SUB)]
-        for i, (text, color) in enumerate(lines):
-            self._text(text, F_SMALL, color, center=(cx, _py(420) + i * _py(26)))
+        self._draw_name_suggest(pygame.Rect(lx0, _py(318), lx1 - lx0, _py(208)), dash)
+        self._draw_name_evolution(
+            pygame.Rect(_px(400), _py(122), _px(375), _py(404)), dash)
 
         self._footer([(self._start_key, ACCENT), "salvar a sessao"])
+
+    def _draw_name_suggest(self, rect, dash):
+        """Perfis salvos que combinam com o nome (exato em laranja)."""
+        self._panel(rect)
+        x = rect.x + _px(14)
+        self._text("perfis salvos", F_SMALL, T_SUB, topleft=(x, rect.y + _py(10)))
+        name, index, names = self.fpga_nome, dash["index"], dash["suggest"]
+        y = rect.y + _py(46)
+        if not index:
+            self._text("nenhum perfil salvo ainda", F_HINT, T_HINT, topleft=(x, y))
+            return
+        if not names:
+            self._text("nenhum perfil comeca assim", F_HINT, T_HINT, topleft=(x, y))
+            return
+        for i, prof in enumerate(names):
+            info = index[prof]
+            exact = prof == name
+            # trechos de mesma cor juntos (o _inline poe espaco entre trechos)
+            parts = []
+            for k, ch in enumerate(prof):
+                col = ACCENT if exact else (T_MAIN if name[k] == ch else T_HINT)
+                if parts and parts[-1][1] == col:
+                    parts[-1] = (parts[-1][0] + ch, col)
+                else:
+                    parts.append((ch, col))
+            n = info["n"]
+            parts.append((f"  {n} {'sessao' if n == 1 else 'sessoes'},"
+                          f" ultima {short_date(info['last'])}", T_SUB if exact else T_HINT))
+            if exact:
+                parts.append(("  < este", ACCENT))
+            self._inline(parts, F_SMALL, T_HINT, midleft=(x, y + _py(i * 30) + _py(10)))
+        if name == NO_PROFILE:
+            self._text("os mais recentes", F_HINT, T_HINT,
+                       bottomright=(rect.right - _px(14), rect.bottom - _py(8)))
+
+    def _draw_name_evolution(self, rect, dash):
+        """Evolucao do perfil: taxa de acerto por sessao + desvio e maior combo."""
+        self._panel(rect)
+        cx, x = rect.centerx, rect.x + _px(16)
+        profile, hist, summ = dash["profile"], dash["history"], dash["summary"]
+        if profile is None:
+            for i, t in enumerate(("sem perfil:", "a sessao e salva sem nome",
+                                   "e sem comparacao")):
+                self._text(t, F_SMALL, T_SUB, center=(cx, rect.centery + _py(i * 28 - 28)))
+            return
+        if not hist:
+            self._text(f"Perfil {profile}", F_BODY, T_MAIN, center=(cx, rect.centery - _py(18)))
+            self._text("primeira sessao deste perfil", F_SMALL, T_SUB,
+                       center=(cx, rect.centery + _py(18)))
+            if dash["suggest"]:
+                self._text("ja jogou antes? complete um perfil salvo", F_HINT, T_HINT,
+                           center=(cx, rect.centery + _py(52)))
+            return
+
+        self._text(f"Evolucao de {profile}", F_BODY, T_MAIN, topleft=(x, rect.y + _py(10)))
+        n = dash["index"].get(profile, {}).get("n", len(hist))
+        shown = f"ultimas {len(hist)} de {n}" if n > len(hist) else f"{n} salvas"
+        self._text(f"sessoes: {shown}", F_HINT, T_HINT,
+                   topright=(rect.right - _px(14), rect.y + _py(16)))
+
+        # Pontos: sessoes salvas + a atual ("agora"), que sera gravada com este nome
+        cur = summ["taxa"]
+        pts = [(h["taxa"], short_date(h["data_hora"]), C_DATA) for h in hist]
+        if cur is not None:
+            pts.append((float(cur), "agora", ACCENT))
+
+        # ── Grafico da taxa de acerto (0-100 %)
+        self._text("taxa de acerto (%)", F_HINT, T_SUB, topleft=(x, rect.y + _py(46)))
+        g = pygame.Rect(rect.x + _px(46), rect.y + _py(74), rect.w - _px(70), _py(140))
+        for v in (0, 50, 100):
+            gy = g.bottom - int(g.h * v / 100)
+            pygame.draw.line(self.screen, PANEL_LINE, (g.x, gy), (g.right, gy), 1)
+            self._text(str(v), F_HINT, T_HINT, midright=(g.x - _px(6), gy))
+        step = g.w / max(1, len(pts) - 1)
+
+        def px_of(i):
+            return int(g.x + (i * step if len(pts) > 1 else g.w / 2))
+
+        xy = [(px_of(i), g.bottom - int(g.h * v / 100)) for i, (v, _, _) in enumerate(pts)]
+        if len(xy) > 1:
+            pygame.draw.lines(self.screen, C_DATA, False, xy, 3)
+        label_all = len(pts) <= 6
+        for i, ((v, lab, col), (px, py)) in enumerate(zip(pts, xy)):
+            pygame.draw.circle(self.screen, col, (px, py), _ps(5 if col == ACCENT else 4))
+            last = i == len(pts) - 1
+            if label_all or i == 0 or last:
+                self._text(lab, F_HINT, ACCENT if col == ACCENT else T_HINT,
+                           midtop=(px, g.bottom + _py(6)))
+            if last:
+                self._text(f"{v:.0f}", F_HINT, col, midbottom=(px, py - _py(6)))
+
+        # ── Faixas pequenas: desvio da assincronia e maior combo
+        rows = [
+            ("desvio do tempo", "desvio_ms", summ["desvio_ms"], " ms", False),
+            ("maior combo", "maior_combo", summ["maior_combo"], "", True),
+        ]
+        y = g.bottom + _py(40)
+        for label, key, cur_v, unit, higher_better in rows:
+            vals = [h[key] for h in hist]
+            series = [v for v in vals if v is not None]
+            spark_cur = cur_v if cur_v is not None else None
+            self._text(label, F_HINT, T_SUB, topleft=(x, y))
+            sr = pygame.Rect(rect.x + _px(140), y + _py(2), _px(130), _py(20))
+            self._sparkline(sr, series + ([spark_cur] if spark_cur is not None else []),
+                            spark_cur is not None)
+            if spark_cur is not None and series:
+                first = series[0]
+                d = spark_cur - first
+                good = (d > 0) == higher_better if abs(d) >= 0.5 else None
+                col = T_HINT if good is None else (C_OK if good else C_WARN)
+                txt = f"{spark_cur:.0f}{unit} (era {first:.0f})"
+            elif spark_cur is not None:
+                txt, col = f"{spark_cur:.0f}{unit}", T_MAIN
+            else:
+                txt, col = "-", T_HINT
+            self._text(txt, F_HINT, col, topright=(rect.right - _px(14), y))
+            y += _py(48)
+
+        # ── Variacao da taxa em relacao a ultima sessao salva
+        delta, color = self._dash_delta("taxa", " pp")
+        if delta:
+            self._text(f"taxa vs. ultima sessao: {delta}", F_HINT, color,
+                       center=(cx, rect.bottom - _py(18)))
+
+    def _sparkline(self, rect, values, mark_last=False):
+        """Linha minima dos valores (escala propria); o ultimo em laranja se mark_last."""
+        if not values:
+            return
+        lo, hi = min(values), max(values)
+        span = (hi - lo) or 1.0
+        step = rect.w / max(1, len(values) - 1)
+        xy = [(int(rect.x + (i * step if len(values) > 1 else rect.w / 2)),
+               int(rect.bottom - (v - lo) / span * rect.h if hi > lo else rect.centery))
+              for i, v in enumerate(values)]
+        if len(xy) > 1:
+            pygame.draw.lines(self.screen, C_DATA, False, xy, 2)
+        pygame.draw.circle(self.screen, ACCENT if mark_last else C_DATA, xy[-1], _ps(4))
 
     # ── Loop principal ────────────────────────────────────────────────────────
 

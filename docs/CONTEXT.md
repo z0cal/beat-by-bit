@@ -46,6 +46,15 @@ FPGA (Verilog) ──UART 921600───► Python (Pygame)
     (a próxima sessão já começa com ele); `---` = sem perfil. O PC só desenha: a caixa do
     cursor fica com borda laranja e um triângulo embaixo. Ao trocar o nome, a comparação
     com a sessão anterior é refeita na hora.
+  - **Perfis salvos e evolução (tela NOME, só PC)**: o CSV do histórico é lido uma vez ao
+    abrir o dashboard. À esquerda, "perfis salvos" lista até 5 perfis que combinam com o
+    nome na tela (`-` é curinga: `A--` casa `ANA` e `AN-`; o igual ao nome em laranja,
+    depois os mais recentes; `---` mostra os mais recentes). À direita, se o nome já tem
+    sessões: gráfico da taxa de acerto das últimas 10 + a sessão atual ("agora"), e
+    sparklines do desvio da assincronia e do maior combo (valor atual vs. o da primeira
+    sessão mostrada). Sessões sem notas ficam fora do gráfico. Funções puras
+    `profile_index`, `match_profiles`, `profile_history` (testes: `pc/test_perfis.py`).
+    A FPGA não muda: a criança ainda gira as letras, a tela só mostra quais nomes existem.
   - **Histórico local**: a sessão é gravada **ao apertar START no dashboard** (saída de
     WIN/LOSE), com o nome escolhido como pseudônimo (`---` grava sem pseudônimo e sem
     comparação), em `sessoes/sessoes.csv` (`--historico` muda o caminho; a pasta está no

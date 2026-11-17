@@ -1,4 +1,4 @@
-// Stub do TFT_eSPI: rasteriza num buffer RGB332 para visualizar o resultado.
+// Stub do TFT_eSPI: rasteriza o sprite (8 bits RGB332 ou 4 bits com paleta) para visualizar.
 #pragma once
 #include <Arduino.h>
 #include <vector>
@@ -17,7 +17,8 @@ class TFT_eSPI {
 class TFT_eSprite : public TFT_eSPI {
  public:
   TFT_eSprite(TFT_eSPI *) {}
-  void *setColorDepth(int8_t) { return this; }
+  void *setColorDepth(int8_t b) { bpp_ = b; return this; }
+  void createPalette(const uint16_t *p, uint8_t n = 16) { for (int i = 0; i < n && i < 16; i++) pal_[i] = p[i]; }
   void *createSprite(int16_t w, int16_t h, uint8_t = 1) {
     w_ = w; h_ = h; buf_.assign((size_t)w * h, 0); return buf_.data();
   }
@@ -55,12 +56,22 @@ class TFT_eSprite : public TFT_eSPI {
     g_fw = w_; g_fh = h_; g_frame.resize(buf_.size());
     for (size_t i = 0; i < buf_.size(); i++) {
       uint8_t v = buf_[i];
-      uint32_t r = (v >> 5) * 255 / 7, g = ((v >> 2) & 7) * 255 / 7, b = (v & 3) * 255 / 3;
+      uint32_t r, g, b;
+      if (bpp_ == 4) {
+        uint16_t c = pal_[v & 15];
+        r = ((c >> 11) & 31) * 255 / 31; g = ((c >> 5) & 63) * 255 / 63; b = (c & 31) * 255 / 31;
+      } else {
+        r = (v >> 5) * 255 / 7; g = ((v >> 2) & 7) * 255 / 7; b = (v & 3) * 255 / 3;
+      }
       g_frame[i] = (r << 16) | (g << 8) | b;
     }
   }
  private:
-  static uint8_t to332(uint32_t c) { return (uint8_t)(((c >> 8) & 0xE0) | ((c >> 6) & 0x1C) | ((c >> 3) & 0x03)); }
-  int w_ = 0, h_ = 0;
+  uint8_t to332(uint32_t c) const {
+    if (bpp_ == 4) return (uint8_t)(c & 15);
+    return (uint8_t)(((c >> 8) & 0xE0) | ((c >> 6) & 0x1C) | ((c >> 3) & 0x03));
+  }
+  int w_ = 0, h_ = 0, bpp_ = 8;
+  uint16_t pal_[16] = {0};
   std::vector<uint8_t> buf_;
 };

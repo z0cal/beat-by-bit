@@ -84,7 +84,7 @@ from sys import exit
 
 import numpy as np
 
-from robo import RobotEvents, RobotLink  # tela do robo (ESP32)
+from robo import RobotEvents, RobotLink, find_robot_port  # tela do robo (ESP32)
 
 try:
     import serial
@@ -3286,10 +3286,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--robo-port",
-        default=None,
-        help="Porta serial da ESP32 do robo (ex.: COM7 ou /dev/ttyUSB1); sem ela, sem robo",
+        default="auto",
+        help="Porta serial da ESP32 do robo (ex.: COM7 ou /dev/ttyUSB1). Padrao 'auto': "
+             "o conversor USB-serial que nao e a porta da FPGA; 'nenhum' desliga o robo",
     )
     args = parser.parse_args()
+
+    robo_port = args.robo_port
+    if robo_port.lower() in ("nenhum", "none", "off", ""):
+        robo_port = None
+    elif robo_port.lower() == "auto":
+        robo_port = find_robot_port(args.port)
+        print(f"[robo] porta automatica: {robo_port}" if robo_port
+              else "[robo] nenhuma ESP32 encontrada: robo desligado")
 
     Renderer(
         serial_port=args.port,
@@ -3298,5 +3307,5 @@ if __name__ == "__main__":
         scale=args.scale,
         audio_offset_ms=args.audio_offset,
         history_path=args.historico,
-        robo_port=args.robo_port,
+        robo_port=robo_port,
     ).run()

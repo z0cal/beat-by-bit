@@ -9,6 +9,7 @@ que a interface ja le (acertos e erros da sessao, e o estado da FPGA).
   C  fim da musica     N  volta ao neutro
 """
 
+import os
 import queue
 import threading
 import time
@@ -55,6 +56,29 @@ class RobotEvents:
             out.append(CMD_NEUTRO)  # saiu da tela do nome
         self._state, self._hits, self._misses = st, hits, misses
         return out
+
+
+# Conversores USB-serial comuns em placas ESP32 (CP210x, CH340, FTDI)
+_USB_UART_VIDS = {0x10C4, 0x1A86, 0x0403}
+
+
+def find_robot_port(fpga_port=None):
+    """
+    Porta da ESP32 quando nao foi informada: o primeiro conversor USB-serial que
+    nao e a porta da FPGA. Devolve None se nao houver nenhum.
+    """
+    if not SERIAL_AVAILABLE:
+        return None
+    from serial.tools import list_ports
+
+    def real(p):
+        return os.path.realpath(p) if p and os.path.exists(p) else p
+
+    skip = real(fpga_port)
+    for info in sorted(list_ports.comports(), key=lambda i: i.device):
+        if info.vid in _USB_UART_VIDS and real(info.device) != skip:
+            return info.device
+    return None
 
 
 class RobotLink(threading.Thread):
